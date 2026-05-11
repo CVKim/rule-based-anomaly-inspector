@@ -50,7 +50,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from anomaly_inspector import (  # noqa: E402
     DynamicToleranceInspector, PhotometricCorrector, ReferenceBuilder,
-    ResidualConfig, make_panel,
+    ResidualConfig, RoiConfig, make_panel,
 )
 from anomaly_inspector.utils import (  # noqa: E402
     SUPPORTED_EXTS, ensure_dir, get_logger, imread_unicode, imwrite_unicode,
@@ -118,6 +118,13 @@ def main() -> None:
                         help="top-hat structuring-element size.")
     parser.add_argument("--dispersion", default="mad", choices=["std", "mad"])
     parser.add_argument("--ref-blur", type=int, default=5)
+    parser.add_argument("--roi", default="otsu_close",
+                        choices=["none", "otsu_close", "fixed_threshold"],
+                        help="Auto-extract part region from the master.")
+    parser.add_argument("--roi-close-ksize", type=int, default=41)
+    parser.add_argument("--roi-erode-px", type=int, default=8)
+    parser.add_argument("--roi-fixed-value", type=float, default=32.0)
+    parser.add_argument("--roi-convex-hull", action="store_true")
     parser.add_argument("--ref-align", dest="ref_align",
                         action="store_true", default=True,
                         help="Phase-correlate normals to the first sample (default).")
@@ -195,17 +202,29 @@ def main() -> None:
         sigma=args.photo_sigma,
         ksize=args.photo_ksize if args.photo_ksize % 2 else args.photo_ksize + 1,
     )
+    roi_cfg = RoiConfig(
+        method=args.roi,                            # type: ignore[arg-type]
+        close_ksize=args.roi_close_ksize if args.roi_close_ksize % 2
+                    else args.roi_close_ksize + 1,
+        erode_px=args.roi_erode_px,
+        convex_hull=args.roi_convex_hull,
+        fixed_value=args.roi_fixed_value,
+    )
     builder = ReferenceBuilder(
         blur_ksize=args.ref_blur,
         align=args.ref_align,
         dispersion=args.dispersion,
         photometric=photometric,
+        roi=roi_cfg,
     )
     t0 = time.time()
     ref = builder.from_images(normals)
-    log.info("reference built in %.2fs (n=%d, dispersion=%s, photometric=%s)",
+    roi_pct = (float((ref.roi_mask > 0).sum()) / ref.roi_mask.size * 100
+               if ref.roi_mask is not None else 100.0)
+    log.info("reference built in %.2fs (n=%d, dispersion=%s, photometric=%s, "
+             "roi=%s [%.1f%% of frame])",
              time.time() - t0, ref.n_samples, ref.method,
-             photometric.method)
+             photometric.method, roi_cfg.method, roi_pct)
 
     # ------------------------------------------------------------------
     # Run each mode against every test image
@@ -244,7 +263,8 @@ def main() -> None:
                                max_cell_width=args.max_cell_width,
                                title=f"{p.name}  |  mode={mode}  "
                                      f"|  defects={len(result.defects)}  "
-                                     f"|  rot={result.rotation_deg:+.2f}°")
+                                     f"|  rot={result.rotation_deg:+.2f}°",
+                               roi_mask=ref.roi_mask)
             imwrite_unicode(mode_dir / f"{p.stem}_panel.png", panel)
 
             rows.append(
