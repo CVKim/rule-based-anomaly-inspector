@@ -6,26 +6,32 @@ master image (or a small bag of known-good samples) and defects appear as
 local deviations: scratches, dents, foreign material, missing components,
 lighting glints, etc. **No training data required.**
 
-The pipeline is six stages, each independently swappable and configurable:
+The pipeline is seven stages, each independently swappable and configurable:
 
 1. **Reference build** — stack ≥20–30 known-good images, compute the
    per-pixel **median** (master) and per-pixel **dispersion** (`std` or
    robust `MAD`) — these become the per-pixel tolerance budget.
-2. **Photometric normalization** *(new in v0.2)* — flat-field divide /
+2. **Photometric normalization** *(v0.2)* — flat-field divide /
    morphological top-hat / CLAHE to flatten low-frequency illumination drift
    *before* differencing. The same correction is applied to both master and
    target.
 3. **Geometric alignment** — translation-only via phase correlation,
-   refinement via ECC (translation + rotation), or *(new in v0.2)*
+   refinement via ECC (translation + rotation), or *(v0.2)*
    log-polar phase correlation that recovers **rotation + scale + translation**
    in a single pass for rotary-stage cameras.
-4. **Asymmetric dynamic thresholding** — per-pixel
+4. **Residual computation** *(new in v0.3)* — pluggable. Pick or fuse:
+   `absdiff` (default — `|target - master|`), `multiscale` (3-level Gaussian
+   pyramid, per-pixel max — recovers wide low-contrast blobs that vanish at
+   full res), `ncc` (sliding-window normalized cross-correlation — robust to
+   global brightness drift), or `gradient` (Sobel/Scharr magnitude diff —
+   sensitive to edge-shape defects).
+5. **Asymmetric dynamic thresholding** — per-pixel
    `base_tolerance + k_sigma * std`, with separate dark and bright budgets
    so a dent-sensitive line can keep dark tight while letting glints slide.
-5. **Mask combination + morphology** — user `ignore_mask` (markers, text,
-   barcodes) **OR**'d with an *(new in v0.2)* auto-derived high-variance
+6. **Mask combination + morphology** — user `ignore_mask` (markers, text,
+   barcodes) **OR**'d with an *(v0.2)* auto-derived high-variance
    mask, then open + close to denoise.
-6. **Blob analysis + classification** *(new in v0.2)* — connected-component
+7. **Blob analysis + classification** *(v0.2)* — connected-component
    filtering by area, then each surviving blob is tagged as
    `scratch / spot / dent / smudge / unknown` from minAreaRect aspect ratio,
    `4πA/P²` circularity, convex-hull solidity, and the signed mean diff
@@ -141,6 +147,24 @@ for d in result.defects:
 | `photometric.method`      | `none`  | `flat_field` for ring-light drift, `top_hat_white` to isolate bright defects.     |
 | `auto_ignore_percentile`  | `null`  | e.g. `99.0` to auto-suppress the noisiest 1% of pixels (typically edge halos).    |
 | `classify_defects`        | `true`  | Tag blobs as scratch/spot/dent/smudge for triage. Disable for raw geometry only.  |
+| `residual.mode`           | `absdiff`| `multiscale` for wide blobs, `ncc` for brightness drift, `gradient` for edge defects. |
+| `residual.gradient_blend` | `0.0`   | >0 blends the gradient residual on top of the primary mode (best of both).        |
+
+### Sweep all four residuals over a folder
+
+```bash
+python scripts/run_inference_panels.py \
+    --normal "path/to/known_good" \
+    --test   "path/to/test_images" \
+    --output outputs/run01 \
+    --modes  absdiff multiscale ncc gradient \
+    --max-input-width 1600        # downsample huge inputs (set 0 to disable)
+```
+
+Produces `outputs/run01/<mode>/<stem>_panel.png` six-cell visualisations
+(image | heatmap | mask pred | pred conf fg | pred conf bg | overlay) and
+a per-mode `summary.csv` with detection counts, recovered alignment, and
+per-defect categories.
 
 ### Choosing a photometric method
 
@@ -167,9 +191,10 @@ for d in result.defects:
 - `feature/*` — branched from `dev`, merged back to `dev` (no fast-forward),
   finally PR'd into `main` at release time.
 
-This repo currently sits at **v0.2.0** on `main`. v0.2.0 added the
-photometric, log-polar, and classification stages described above on top of
-the v0.1.0 core.
+This repo currently sits at **v0.3.0** on `main`. v0.3.0 added the pluggable
+residual stage (multiscale / NCC / gradient) and the six-panel visualisation
++ inference-sweep script on top of v0.2.0's photometric, log-polar, and
+classification stages, themselves built on the v0.1.0 core.
 
 ## Tests
 
@@ -177,9 +202,9 @@ the v0.1.0 core.
 python -m pytest -q
 ```
 
-29 synthetic-data smoke tests covering the reference builder, all three
-alignment modes, the photometric stage, the classifier, and end-to-end
-defect detection under illumination drift and rotation.
+45 synthetic-data smoke tests covering the reference builder, all three
+alignment modes, the photometric stage, the classifier, every residual
+mode, and end-to-end defect detection under illumination drift and rotation.
 
 ## License
 

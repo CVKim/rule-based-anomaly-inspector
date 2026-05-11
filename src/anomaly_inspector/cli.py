@@ -10,9 +10,10 @@ import typer
 
 from . import ReferenceBuilder, DynamicToleranceInspector
 from .photometric import PhotometricCorrector
+from .residual import ResidualConfig
 from .utils import (
-    ensure_dir, get_logger, list_images, load_config, load_gray,
-    load_reference, save_reference,
+    ensure_dir, get_logger, imwrite_unicode, list_images, load_config,
+    load_gray, load_reference, save_reference,
 )
 from .visualization import side_by_side
 
@@ -93,6 +94,14 @@ def run(
         help="Auto-mask pixels above this tolerance percentile (e.g. 99.0)."),
     classify_defects: bool = typer.Option(True, "--classify/--no-classify",
                                           help="Classify each blob as scratch/spot/dent/smudge."),
+    residual_mode: str = typer.Option("absdiff", "--residual",
+                                      help="'absdiff' | 'multiscale' | 'ncc' | 'gradient'."),
+    pyramid_levels: int = typer.Option(3, "--pyramid-levels"),
+    ncc_window: int = typer.Option(15, "--ncc-window"),
+    gradient_op: str = typer.Option("scharr", "--gradient-op",
+                                    help="'sobel' or 'scharr'."),
+    gradient_blend: float = typer.Option(0.0, "--gradient-blend",
+                                         help="Add gradient residual to the primary residual with this weight (0=off)."),
 ) -> None:
     """Inspect one image (or every image in a folder) and write overlays."""
     log = get_logger()
@@ -111,6 +120,15 @@ def run(
     auto_ignore_percentile = insp_cfg.get("auto_ignore_percentile",
                                           auto_ignore_percentile)
     classify_defects = insp_cfg.get("classify_defects", classify_defects)
+    res_cfg = cfg.get("residual", {})
+    if isinstance(res_cfg, str):
+        res_cfg = {"mode": res_cfg}
+    res_cfg.setdefault("mode", residual_mode)
+    res_cfg.setdefault("pyramid_levels", pyramid_levels)
+    res_cfg.setdefault("ncc_window", ncc_window)
+    res_cfg.setdefault("gradient_op", gradient_op)
+    res_cfg.setdefault("gradient_blend", gradient_blend)
+    residual = ResidualConfig.from_meta(res_cfg)
 
     master, tolerance, meta = load_reference(reference)
     log.info("loaded reference: shape=%s, meta=%s", master.shape, meta)
@@ -130,6 +148,7 @@ def run(
         base_tolerance_bright=base_tolerance_bright,
         auto_ignore_percentile=auto_ignore_percentile,
         classify_defects=classify_defects,
+        residual=residual,
     )
 
     if input.is_dir():
@@ -146,7 +165,7 @@ def run(
         result = inspector.inspect(img)
         vis = side_by_side(result, ref.master)
         out_path = output / f"{p.stem}_result.png"
-        cv2.imwrite(str(out_path), vis)
+        imwrite_unicode(out_path, vis)
         cat_summary = ";".join(f"{d.category}/{d.polarity}"
                                for d in result.defects) or "-"
         log.info("%-40s defects=%d shift=(%.2f, %.2f) rot=%.2f scale=%.4f categories=%s",
