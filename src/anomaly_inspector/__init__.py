@@ -2,7 +2,11 @@
 
 from .inspector import DynamicToleranceInspector, InspectionResult, DefectInfo
 from .reference import ReferenceBuilder, Reference
-from .alignment import align_translation, align_ecc
+from .alignment import align_translation, align_ecc, align_log_polar, estimate_rotation_scale
+from .classification import auto_unreliable_mask, classify, shape_features
+from .photometric import PhotometricCorrector, flat_field_divide, top_hat, clahe
+from .residual import ResidualConfig, compute_residual
+from .panel import make_panel
 from .visualization import draw_defects, side_by_side
 
 __all__ = [
@@ -13,8 +17,20 @@ __all__ = [
     "Reference",
     "align_translation",
     "align_ecc",
+    "align_log_polar",
+    "estimate_rotation_scale",
+    "PhotometricCorrector",
+    "flat_field_divide",
+    "top_hat",
+    "clahe",
+    "auto_unreliable_mask",
+    "classify",
+    "shape_features",
+    "ResidualConfig",
+    "compute_residual",
+    "make_panel",
     "draw_defects",
     "side_by_side",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
