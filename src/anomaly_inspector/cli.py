@@ -11,6 +11,7 @@ import typer
 from . import ReferenceBuilder, DynamicToleranceInspector
 from .photometric import PhotometricCorrector
 from .residual import ResidualConfig
+from .roi import RoiConfig
 from .utils import (
     ensure_dir, get_logger, imwrite_unicode, list_images, load_config,
     load_gray, load_reference, save_reference,
@@ -36,6 +37,10 @@ def run(
                                    help="'std' or 'mad'."),
     photometric: str = typer.Option("none", "--photometric",
                                     help="'none' | 'flat_field' | 'top_hat_white' | 'top_hat_black' | 'clahe'."),
+    roi_method: str = typer.Option("none", "--roi",
+                                   help="'none' | 'otsu_close' | 'fixed_threshold' — auto-extract part region."),
+    roi_close_ksize: int = typer.Option(41, "--roi-close-ksize"),
+    roi_erode_px: int = typer.Option(6, "--roi-erode-px"),
 ) -> None:
     """Build a reference from a folder of known-good images."""
     log = get_logger()
@@ -50,20 +55,32 @@ def run(
     photo_cfg.setdefault("method", photometric)
     corrector = PhotometricCorrector.from_meta(photo_cfg)
 
+    roi_cfg = ref_cfg.get("roi", {})
+    if isinstance(roi_cfg, str):
+        roi_cfg = {"method": roi_cfg}
+    roi_cfg.setdefault("method", roi_method)
+    roi_cfg.setdefault("close_ksize", roi_close_ksize)
+    roi_cfg.setdefault("erode_px", roi_erode_px)
+    roi_config = RoiConfig.from_meta(roi_cfg)
+
     paths = list_images(input)
     if not paths:
         raise typer.BadParameter(f"no images in {input}")
     log.info("loading %d images from %s", len(paths), input)
 
     builder = ReferenceBuilder(blur_ksize=blur_ksize, align=align,
-                               dispersion=dispersion, photometric=corrector)
+                               dispersion=dispersion, photometric=corrector,
+                               roi=roi_config)
     ref = builder.from_paths(paths)
     save_reference(output, ref.master, ref.tolerance,
                    meta={"n_samples": ref.n_samples, "dispersion": ref.method,
                          "blur_ksize": blur_ksize,
-                         "photometric": corrector.to_meta()})
-    log.info("wrote reference to %s (n=%d, shape=%s, photometric=%s)",
-             output, ref.n_samples, ref.master.shape, corrector.method)
+                         "photometric": corrector.to_meta(),
+                         "roi": roi_config.to_meta()},
+                   roi_mask=ref.roi_mask)
+    log.info("wrote reference to %s (n=%d, shape=%s, photometric=%s, roi=%s)",
+             output, ref.n_samples, ref.master.shape, corrector.method,
+             roi_config.method)
 
 
 @inspect_app.command()
@@ -130,14 +147,18 @@ def run(
     res_cfg.setdefault("gradient_blend", gradient_blend)
     residual = ResidualConfig.from_meta(res_cfg)
 
-    master, tolerance, meta = load_reference(reference)
-    log.info("loaded reference: shape=%s, meta=%s", master.shape, meta)
+    master, tolerance, meta, roi_mask = load_reference(reference)
+    log.info("loaded reference: shape=%s, meta=%s, roi_mask=%s",
+             master.shape, meta,
+             "yes" if roi_mask is not None else "no")
 
     from .reference import Reference
     ref = Reference(master=master, tolerance=tolerance,
                     method=meta.get("dispersion", "std"),
                     n_samples=meta.get("n_samples", 0),
-                    photometric=PhotometricCorrector.from_meta(meta.get("photometric")))
+                    photometric=PhotometricCorrector.from_meta(meta.get("photometric")),
+                    roi=RoiConfig.from_meta(meta.get("roi")),
+                    roi_mask=roi_mask)
 
     inspector = DynamicToleranceInspector(
         ref, k_sigma=k_sigma, base_tolerance=base_tolerance,
