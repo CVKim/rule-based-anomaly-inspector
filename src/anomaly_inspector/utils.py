@@ -38,10 +38,41 @@ def list_images(folder: str | Path) -> list[Path]:
 
 
 def load_gray(path: str | Path) -> np.ndarray:
-    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    img = imread_unicode(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise IOError(f"failed to read image: {path}")
     return img
+
+
+def imread_unicode(path: str | Path, flags: int = cv2.IMREAD_UNCHANGED) -> np.ndarray | None:
+    """Unicode-path-safe replacement for cv2.imread.
+
+    cv2.imread on Windows decodes the path through the active ANSI codepage,
+    which mangles non-ASCII characters (Korean, Japanese, etc.) and silently
+    fails. Reading the bytes via numpy and decoding in-memory dodges the
+    issue without changing call sites.
+    """
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+    except (FileNotFoundError, OSError):
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, flags)
+
+
+def imwrite_unicode(path: str | Path, img: np.ndarray,
+                    params: list[int] | None = None) -> bool:
+    """Unicode-safe replacement for cv2.imwrite. Encodes via the file
+    extension and writes raw bytes, bypassing OpenCV's ANSI path handling."""
+    p = Path(path)
+    ext = p.suffix or ".png"
+    ok, buf = cv2.imencode(ext, img, params or [])
+    if not ok:
+        return False
+    p.parent.mkdir(parents=True, exist_ok=True)
+    buf.tofile(str(p))
+    return True
 
 
 def load_config(path: str | Path) -> dict[str, Any]:

@@ -14,6 +14,7 @@ from .classification import (
 )
 from .photometric import PhotometricCorrector
 from .reference import Reference
+from .residual import ResidualConfig, compute_residual
 from .utils import get_logger
 
 
@@ -85,7 +86,8 @@ class DynamicToleranceInspector:
                  base_tolerance_dark: float | None = None,
                  base_tolerance_bright: float | None = None,
                  auto_ignore_percentile: float | None = None,
-                 classify_defects: bool = True):
+                 classify_defects: bool = True,
+                 residual: ResidualConfig | None = None):
         if k_sigma <= 0:
             raise ValueError("k_sigma must be > 0")
         if base_tolerance < 0:
@@ -125,6 +127,7 @@ class DynamicToleranceInspector:
             if auto_ignore_percentile is not None else None
         )
         self.classify_defects = bool(classify_defects)
+        self.residual_config = residual or ResidualConfig()
         self._auto_ignore_cache: np.ndarray | None = None
         # Default to whatever photometric normalizer the reference was built
         # with — they MUST match, or the master and the target will live in
@@ -158,14 +161,19 @@ class DynamicToleranceInspector:
         prepared = self._preprocess(target)
         aligned, shift, method, rotation_deg, scale = self._align(prepared)
 
-        signed = aligned.astype(np.float32) - self.ref.master
-        diff = np.abs(signed)
+        signed, diff = compute_residual(self.ref.master, aligned.astype(np.float32),
+                                        self.residual_config)
 
         # Symmetric threshold (used for the headline ``threshold_map`` field)
         # plus split bright/dark thresholds applied during binarization.
         threshold_map = self.base_tolerance + self.k_sigma * self.ref.tolerance
         bright_thresh = self.base_tolerance_bright + self.k_sigma_bright * self.ref.tolerance
         dark_thresh = self.base_tolerance_dark + self.k_sigma_dark * self.ref.tolerance
+        # ``signed`` only carries true polarity for absdiff/multiscale modes;
+        # for ncc/gradient it equals ``diff`` (always >= 0), which makes the
+        # ``-signed > dark_thresh`` branch never fire — the bright threshold
+        # then acts as a single magnitude check, the right behaviour for
+        # sign-less residuals.
         bright_hits = signed > bright_thresh
         dark_hits = -signed > dark_thresh
         anomaly_mask = ((bright_hits | dark_hits).astype(np.uint8)) * 255

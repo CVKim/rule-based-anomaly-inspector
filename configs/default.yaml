@@ -25,3 +25,13 @@ inspect:
   base_tolerance_bright: null
   auto_ignore_percentile: null   # e.g. 99.0 — auto-mask high-variance pixels
   classify_defects: true         # tag each blob as scratch / spot / dent / smudge
+
+residual:
+  mode: absdiff           # 'absdiff' | 'multiscale' | 'ncc' | 'gradient'
+  pyramid_levels: 3       # multiscale: number of Gaussian-pyramid levels
+  pyramid_combine: max    # multiscale: 'max' (catch most-prominent scale) or 'mean'
+  ncc_window: 15          # ncc: square window side (odd, >= 3)
+  gradient_op: scharr     # gradient: 'scharr' (preferred for ksize=3) or 'sobel'
+  gradient_ksize: 3       # gradient: 1, 3, 5, or 7
+  gradient_blend: 0.0     # >0 to ADD weighted gradient residual on top of mode
+  extra_modes: []         # e.g. ['gradient'] to fuse extra modes via per-pixel max

@@ -1,5 +1,62 @@
 # Changelog
 
+## v0.3.0
+
+Pluggable residual stage + reporting tooling. Default residual mode stays
+``absdiff`` so v0.2 behaviour is bit-for-bit preserved.
+
+### Added
+
+- **Residual module** (``anomaly_inspector.residual``)
+  - ``ResidualConfig`` dataclass selecting one of ``absdiff`` /
+    ``multiscale`` / ``ncc`` / ``gradient`` plus mode-specific knobs.
+  - ``compute_residual`` returns ``(signed, abs)`` maps in gray-level units
+    so the dynamic-tolerance threshold keeps its operator-facing meaning
+    regardless of the underlying metric.
+  - ``gradient_blend`` knob ADDS the gradient residual on top of the
+    primary residual with a configurable weight; ``extra_modes`` fuses
+    additional modes via per-pixel max.
+  - ``--residual``, ``--pyramid-levels``, ``--ncc-window``, ``--gradient-op``,
+    ``--gradient-blend`` CLI flags and a matching ``residual:`` config block.
+
+- **Six-panel debug visualisation** (``anomaly_inspector.panel.make_panel``)
+  - Layout: ``image | heatmap | mask pred | pred conf fg | pred conf bg | overlay``.
+  - Caps each cell width to keep PNG files manageable for 12 MP+ sources;
+    overall panel is downsized losslessly.
+
+- **Multi-mode inference sweep script**
+  ``scripts/run_inference_panels.py``
+  - Builds one shared reference and runs the full pipeline under each
+    requested residual mode, writing ``<output>/<mode>/<stem>_panel.png``
+    plus a per-mode ``summary.csv`` (defect count, alignment, categories,
+    inference latency).
+  - Drops the script's own folder from ``sys.path`` *before* any other
+    imports so the sibling ``scripts/inspect.py`` doesn't shadow stdlib
+    ``inspect`` (which previously broke ``numpy``/``dataclasses`` import).
+
+- **Unicode-safe Windows I/O** (``utils.imread_unicode`` / ``imwrite_unicode``)
+  - ``cv2.imread``/``imwrite`` mangle non-ASCII paths through the active
+    ANSI codepage on Windows. The new helpers go via
+    ``np.fromfile`` + ``cv2.imdecode``/``cv2.imencode`` and round-trip
+    Korean / Japanese / Chinese paths cleanly. ``load_gray`` and the CLI
+    now use them.
+
+### Changed
+
+- ``DynamicToleranceInspector`` accepts ``residual: ResidualConfig`` and
+  delegates the diff/threshold step to ``compute_residual``. The bright/
+  dark asymmetric thresholds still apply on the *signed* output of
+  absdiff/multiscale; for ncc/gradient (which are sign-less) only the
+  bright threshold fires, which is the right behaviour for those metrics.
+
+### Tests
+
+- 16 new tests in ``test_residual.py`` covering config validation,
+  per-mode residual semantics (NCC stable under brightness shift,
+  gradient lights up on new edges, multiscale catches wide low-contrast
+  blobs), and a parametrised pipeline round-trip across all four modes.
+  Suite total: **45 tests, all green**.
+
 ## v0.2.0
 
 Three rule-based extensions on top of the v0.1.0 core. All v0.1 defaults are
