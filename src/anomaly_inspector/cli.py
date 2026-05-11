@@ -9,6 +9,7 @@ import cv2
 import typer
 
 from . import ReferenceBuilder, DynamicToleranceInspector
+from .photometric import PhotometricCorrector
 from .utils import (
     ensure_dir, get_logger, list_images, load_config, load_gray,
     load_reference, save_reference,
@@ -32,6 +33,8 @@ def run(
     align: bool = typer.Option(True, "--align/--no-align"),
     dispersion: str = typer.Option("std", "--dispersion",
                                    help="'std' or 'mad'."),
+    photometric: str = typer.Option("none", "--photometric",
+                                    help="'none' | 'flat_field' | 'top_hat_white' | 'top_hat_black' | 'clahe'."),
 ) -> None:
     """Build a reference from a folder of known-good images."""
     log = get_logger()
@@ -40,6 +43,11 @@ def run(
     blur_ksize = ref_cfg.get("blur_ksize", blur_ksize)
     align = ref_cfg.get("align", align)
     dispersion = ref_cfg.get("dispersion", dispersion)
+    photo_cfg = ref_cfg.get("photometric", {})
+    if isinstance(photo_cfg, str):
+        photo_cfg = {"method": photo_cfg}
+    photo_cfg.setdefault("method", photometric)
+    corrector = PhotometricCorrector.from_meta(photo_cfg)
 
     paths = list_images(input)
     if not paths:
@@ -47,13 +55,14 @@ def run(
     log.info("loading %d images from %s", len(paths), input)
 
     builder = ReferenceBuilder(blur_ksize=blur_ksize, align=align,
-                               dispersion=dispersion)
+                               dispersion=dispersion, photometric=corrector)
     ref = builder.from_paths(paths)
     save_reference(output, ref.master, ref.tolerance,
                    meta={"n_samples": ref.n_samples, "dispersion": ref.method,
-                         "blur_ksize": blur_ksize})
-    log.info("wrote reference to %s (n=%d, shape=%s)",
-             output, ref.n_samples, ref.master.shape)
+                         "blur_ksize": blur_ksize,
+                         "photometric": corrector.to_meta()})
+    log.info("wrote reference to %s (n=%d, shape=%s, photometric=%s)",
+             output, ref.n_samples, ref.master.shape, corrector.method)
 
 
 @inspect_app.command()
@@ -90,7 +99,8 @@ def run(
     from .reference import Reference
     ref = Reference(master=master, tolerance=tolerance,
                     method=meta.get("dispersion", "std"),
-                    n_samples=meta.get("n_samples", 0))
+                    n_samples=meta.get("n_samples", 0),
+                    photometric=PhotometricCorrector.from_meta(meta.get("photometric")))
 
     inspector = DynamicToleranceInspector(
         ref, k_sigma=k_sigma, base_tolerance=base_tolerance,

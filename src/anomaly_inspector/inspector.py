@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from .alignment import align_ecc, align_translation
+from .photometric import PhotometricCorrector
 from .reference import Reference
 from .utils import get_logger
 
@@ -67,7 +68,8 @@ class DynamicToleranceInspector:
                  min_blob_area: int = 15,
                  blur_ksize: int = 5,
                  align_method: str = "phase",
-                 morph_ksize: int = 3):
+                 morph_ksize: int = 3,
+                 photometric: PhotometricCorrector | None = None):
         if k_sigma <= 0:
             raise ValueError("k_sigma must be > 0")
         if base_tolerance < 0:
@@ -86,6 +88,16 @@ class DynamicToleranceInspector:
         self.blur_ksize = int(blur_ksize)
         self.align_method = align_method
         self.morph_ksize = int(morph_ksize)
+        # Default to whatever photometric normalizer the reference was built
+        # with — they MUST match, or the master and the target will live in
+        # different brightness spaces.
+        self.photometric = photometric or reference.photometric
+        if self.photometric.method != reference.photometric.method:
+            get_logger().warning(
+                "photometric method on inspector (%s) differs from reference (%s); "
+                "this will likely inflate the diff map",
+                self.photometric.method, reference.photometric.method,
+            )
         self.log = get_logger()
 
     # ---------- public ---------------------------------------------------
@@ -141,6 +153,8 @@ class DynamicToleranceInspector:
             )
 
     def _preprocess(self, target: np.ndarray) -> np.ndarray:
+        if self.photometric.method != "none":
+            target = self.photometric.apply(target)
         if self.blur_ksize > 1:
             return cv2.GaussianBlur(target, (self.blur_ksize, self.blur_ksize), 0)
         return target

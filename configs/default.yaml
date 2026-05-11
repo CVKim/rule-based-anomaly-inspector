@@ -5,6 +5,12 @@ reference:
   blur_ksize: 5         # Gaussian blur applied before stacking
   align: true           # phase-correlation align each sample to the first
   dispersion: std       # 'std' (fast) or 'mad' (robust against bad samples)
+  photometric:          # illumination normalization — applied to BOTH master and target
+    method: none        # 'none' | 'flat_field' | 'top_hat_white' | 'top_hat_black' | 'clahe'
+    sigma: 31.0         # flat_field Gaussian sigma (>> defect size)
+    ksize: 51           # top-hat structuring-element size (>> defect size, must be odd)
+    clip_limit: 2.0     # CLAHE clip limit
+    tile_grid: 8        # CLAHE tile grid (NxN tiles)
 
 inspect:
   k_sigma: 4.0          # threshold = base_tolerance + k_sigma * std
