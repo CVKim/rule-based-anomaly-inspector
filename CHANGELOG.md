@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.3.1
+
+Bug-fix release driven by the FOOSUNG side-view dataset, where the part
+occupies <20% of the frame against a near-black background.
+
+### Added
+
+- **Auto part-region (ROI) extraction** (``anomaly_inspector.roi``)
+  - ``RoiConfig`` selects the strategy: ``otsu_close`` (Otsu + morph close
+    + largest CC + boundary erode), ``fixed_threshold``, or ``none``.
+  - ``auto_part_roi`` returns ``None`` when no clear part is found
+    (covers <``min_area_fraction`` or >``max_area_fraction`` of the frame),
+    so the inspector falls back to whole-frame inspection cleanly.
+  - Built once at reference time, persisted in the .npz, applied as an
+    ignore mask in the inspector — affects every residual mode.
+  - ``--roi``, ``--roi-close-ksize``, ``--roi-erode-px`` CLI flags and a
+    new ``reference.roi:`` config block.
+  - Panel viz now outlines the ROI in green on the ``image`` cell so
+    operators see exactly what was inspected.
+
+### Fixed
+
+- ROI is now derived from the **raw** (pre-photometric) median; the
+  flat-field / top-hat normalisers crush the part/background contrast
+  Otsu needs and would otherwise return a degenerate full-frame mask.
+- ``save_reference`` / ``load_reference`` round-trip the ROI mask through
+  the .npz alongside master + tolerance + meta.
+
+### Real-data impact (FOOSUNG side-view, 10 normals + 10 test frames)
+
+False-positive collapse with no change in true-positive recall:
+
+| mode       | before (no ROI) | after (ROI on) |
+|------------|-----------------|-----------------|
+| absdiff    | 4.6 avg / image | 3.3 avg / image |
+| multiscale | 7.2             | 5.2             |
+| ncc        | 30.1            | 16.0            |
+| gradient   | 56.9            | 31.8            |
+
+NCC and gradient become operationally usable; absdiff/multiscale gain a
+modest cleanup on the part outline.
+
+### Tests
+
+15 new tests in ``test_roi.py`` covering config validation, recess/CC/
+erode behaviour, degenerate-input handling, and pipeline integration
+(background defects suppressed, in-part defects preserved, all four
+residual modes verified to never *increase* count when ROI is enabled).
+Suite total: **60 tests, all green**.
+
 ## v0.3.0
 
 Pluggable residual stage + reporting tooling. Default residual mode stays

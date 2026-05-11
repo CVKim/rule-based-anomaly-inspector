@@ -297,7 +297,9 @@ class DynamicToleranceInspector:
 
     def _combined_ignore(self, user_mask: Optional[np.ndarray],
                          shape: tuple[int, int]) -> Optional[np.ndarray]:
-        """OR the user-supplied ignore mask with the auto-derived one (if on)."""
+        """OR all ignore-source masks: user-supplied, auto-unreliable
+        (high-tolerance percentile), and out-of-ROI (everything outside the
+        part region recorded in the reference)."""
         masks: list[np.ndarray] = []
         if user_mask is not None:
             masks.append(self._binarize_mask(user_mask))
@@ -308,6 +310,9 @@ class DynamicToleranceInspector:
                     percentile=self.auto_ignore_percentile,
                 )
             masks.append(self._auto_ignore_cache)
+        if self.ref.roi_mask is not None:
+            # ROI mask = where the part *is*; the inverse is where to ignore.
+            masks.append(cv2.bitwise_not(self.ref.roi_mask))
         if not masks:
             return None
         out = masks[0]

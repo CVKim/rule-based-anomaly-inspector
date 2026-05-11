@@ -11,6 +11,7 @@ import numpy as np
 
 from .alignment import align_translation
 from .photometric import PhotometricCorrector
+from .roi import RoiConfig, auto_part_roi
 from .utils import get_logger, load_gray, stack_images
 
 
@@ -21,6 +22,8 @@ class Reference:
     method: str              # "std" or "mad"
     n_samples: int
     photometric: PhotometricCorrector = field(default_factory=lambda: PhotometricCorrector())
+    roi: RoiConfig = field(default_factory=lambda: RoiConfig())
+    roi_mask: np.ndarray | None = None    # uint8 HxW or None when method='none'
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -45,7 +48,8 @@ class ReferenceBuilder:
                  blur_ksize: int = 5,
                  align: bool = True,
                  dispersion: str = "std",
-                 photometric: PhotometricCorrector | None = None):
+                 photometric: PhotometricCorrector | None = None,
+                 roi: RoiConfig | None = None):
         if blur_ksize % 2 == 0 or blur_ksize < 1:
             raise ValueError("blur_ksize must be a positive odd integer")
         if dispersion not in {"std", "mad"}:
@@ -54,6 +58,7 @@ class ReferenceBuilder:
         self.align = align
         self.dispersion = dispersion
         self.photometric = photometric or PhotometricCorrector(method="none")
+        self.roi = roi or RoiConfig(method="none")
         self.log = get_logger()
 
     # ---------- public ---------------------------------------------------
@@ -87,12 +92,26 @@ class ReferenceBuilder:
         master = np.median(stack, axis=0).astype(np.float32)
         tolerance = self._dispersion(stack, master)
 
-        self.log.info("built reference: shape=%s, n=%d, dispersion=%s, photometric=%s",
+        # ROI extraction works best on the RAW (pre-photometric) median: the
+        # flat-field / top-hat normalisers compress the part/background
+        # dynamic range, which collapses Otsu's bimodal histogram.
+        if self.roi.method != "none":
+            raw_imgs = [self._raw_for_roi(img) for img in images]
+            raw_stack = stack_images(raw_imgs).astype(np.float32)
+            raw_master = np.median(raw_stack, axis=0).astype(np.float32)
+            roi_mask = auto_part_roi(raw_master, self.roi)
+        else:
+            roi_mask = None
+        roi_frac = (float((roi_mask > 0).sum()) / roi_mask.size
+                    if roi_mask is not None else 1.0)
+        self.log.info("built reference: shape=%s, n=%d, dispersion=%s, photometric=%s, "
+                      "roi=%s (%.1f%% of frame)",
                       master.shape, len(images), self.dispersion,
-                      self.photometric.method)
+                      self.photometric.method, self.roi.method, roi_frac * 100)
         return Reference(master=master, tolerance=tolerance,
                          method=self.dispersion, n_samples=len(images),
-                         photometric=self.photometric)
+                         photometric=self.photometric,
+                         roi=self.roi, roi_mask=roi_mask)
 
     # ---------- internals ------------------------------------------------
 
@@ -103,6 +122,16 @@ class ReferenceBuilder:
         # smooths over any small artifacts that the normalizer introduces.
         if self.photometric.method != "none":
             img = self.photometric.apply(img)
+        if self.blur_ksize > 1:
+            img = cv2.GaussianBlur(img, (self.blur_ksize, self.blur_ksize), 0)
+        return img
+
+    def _raw_for_roi(self, img: np.ndarray) -> np.ndarray:
+        """Photometric-free preprocessed image used only for ROI extraction.
+        Same gray + light-blur path as ``_preprocess``, minus the photometric
+        step that would crush the part/background contrast."""
+        if img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         if self.blur_ksize > 1:
             img = cv2.GaussianBlur(img, (self.blur_ksize, self.blur_ksize), 0)
         return img

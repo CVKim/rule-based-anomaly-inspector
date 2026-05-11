@@ -30,7 +30,8 @@ from .visualization import draw_defects
 def make_panel(image: np.ndarray, result: InspectionResult,
                threshold_map: np.ndarray | None = None,
                max_cell_width: int = 600,
-               title: str | None = None) -> np.ndarray:
+               title: str | None = None,
+               roi_mask: np.ndarray | None = None) -> np.ndarray:
     """Compose a horizontal six-cell panel as a single BGR uint8 image.
 
     Parameters
@@ -53,6 +54,13 @@ def make_panel(image: np.ndarray, result: InspectionResult,
         image_bgr = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     else:
         image_bgr = image.copy()
+
+    # Outline the ROI on the image cell so the operator can see exactly
+    # what region was actually inspected.
+    if roi_mask is not None:
+        contours, _ = cv2.findContours(roi_mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(image_bgr, contours, -1, (0, 255, 0), 2)
 
     aligned = result.aligned
     if aligned.ndim == 2:

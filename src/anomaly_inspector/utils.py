@@ -87,24 +87,29 @@ def ensure_dir(path: str | Path) -> Path:
 
 
 def save_reference(path: str | Path, master: np.ndarray, tolerance: np.ndarray,
-                   meta: dict[str, Any] | None = None) -> None:
-    """Persist master + tolerance map (and a meta dict) as a single npz."""
+                   meta: dict[str, Any] | None = None,
+                   roi_mask: np.ndarray | None = None) -> None:
+    """Persist master + tolerance map (+ optional ROI mask + meta) as a single npz."""
     ensure_dir(Path(path).parent)
-    np.savez_compressed(
-        path,
-        master=master.astype(np.float32),
-        tolerance=tolerance.astype(np.float32),
-        meta=np.array([yaml.safe_dump(meta or {})], dtype=object),
-    )
+    arrays: dict[str, np.ndarray] = {
+        "master": master.astype(np.float32),
+        "tolerance": tolerance.astype(np.float32),
+        "meta": np.array([yaml.safe_dump(meta or {})], dtype=object),
+    }
+    if roi_mask is not None:
+        arrays["roi_mask"] = roi_mask.astype(np.uint8)
+    np.savez_compressed(path, **arrays)
 
 
-def load_reference(path: str | Path) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+def load_reference(path: str | Path) -> tuple[np.ndarray, np.ndarray,
+                                               dict[str, Any], np.ndarray | None]:
     data = np.load(path, allow_pickle=True)
     master = data["master"].astype(np.float32)
     tolerance = data["tolerance"].astype(np.float32)
     meta_raw = data["meta"][0] if "meta" in data.files else "{}"
     meta = yaml.safe_load(meta_raw) or {}
-    return master, tolerance, meta
+    roi_mask = data["roi_mask"].astype(np.uint8) if "roi_mask" in data.files else None
+    return master, tolerance, meta, roi_mask
 
 
 def stack_images(images: Iterable[np.ndarray]) -> np.ndarray:

@@ -12,6 +12,14 @@ reference:
     clip_limit: 2.0     # CLAHE clip limit
     tile_grid: 8        # CLAHE tile grid (NxN tiles)
 
+  roi:                  # auto-extracted "where the part lives" mask
+    method: none        # 'none' | 'otsu_close' | 'fixed_threshold'
+    close_ksize: 41     # morph-close kernel — must exceed widest in-part recess
+    erode_px: 6         # shrink the mask by N px to drop the boundary halo
+    convex_hull: false  # tighten silhouette to convex (good for convex parts)
+    fixed_value: 32.0   # only used when method=fixed_threshold
+    min_area_fraction: 0.005   # reject "part" candidates below 0.5% of frame
+
 inspect:
   k_sigma: 4.0          # threshold = base_tolerance + k_sigma * std (symmetric default)
   base_tolerance: 5.0   # gray-level floor (8-bit)
