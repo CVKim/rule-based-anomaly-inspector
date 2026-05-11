@@ -79,7 +79,8 @@ def run(
     min_blob_area: int = typer.Option(15, "--min-blob-area"),
     blur_ksize: int = typer.Option(5, "--blur-ksize"),
     align_method: str = typer.Option("phase", "--align-method",
-                                     help="'none', 'phase', or 'phase+ecc'."),
+                                     help="'none' | 'phase' | 'phase+ecc' | "
+                                          "'logpolar' | 'logpolar+phase'."),
     morph_ksize: int = typer.Option(3, "--morph-ksize"),
 ) -> None:
     """Inspect one image (or every image in a folder) and write overlays."""
@@ -116,17 +117,20 @@ def run(
         raise typer.BadParameter(f"input does not exist: {input}")
 
     ensure_dir(output)
-    summary_lines = ["filename,n_defects,shift_x,shift_y"]
+    summary_lines = ["filename,n_defects,shift_x,shift_y,rotation_deg,scale"]
     for p in paths:
         img = load_gray(p)
         result = inspector.inspect(img)
         vis = side_by_side(result, ref.master)
         out_path = output / f"{p.stem}_result.png"
         cv2.imwrite(str(out_path), vis)
-        log.info("%-40s defects=%d shift=(%.2f, %.2f)",
-                 p.name, len(result.defects), *result.shift)
+        log.info("%-40s defects=%d shift=(%.2f, %.2f) rot=%.2f scale=%.4f",
+                 p.name, len(result.defects), *result.shift,
+                 result.rotation_deg, result.scale)
         summary_lines.append(
-            f"{p.name},{len(result.defects)},{result.shift[0]:.3f},{result.shift[1]:.3f}"
+            f"{p.name},{len(result.defects)},"
+            f"{result.shift[0]:.3f},{result.shift[1]:.3f},"
+            f"{result.rotation_deg:.3f},{result.scale:.5f}"
         )
 
     (output / "summary.csv").write_text("\n".join(summary_lines), encoding="utf-8")

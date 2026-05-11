@@ -8,7 +8,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from .alignment import align_ecc, align_translation
+from .alignment import align_ecc, align_log_polar, align_translation
 from .photometric import PhotometricCorrector
 from .reference import Reference
 from .utils import get_logger
@@ -31,6 +31,8 @@ class InspectionResult:
     anomaly_mask: np.ndarray       # uint8, 0/255
     defects: list[DefectInfo] = field(default_factory=list)
     shift: tuple[float, float] = (0.0, 0.0)
+    rotation_deg: float = 0.0
+    scale: float = 1.0
     align_method: str = "phase"
 
     @property
@@ -74,7 +76,8 @@ class DynamicToleranceInspector:
             raise ValueError("k_sigma must be > 0")
         if base_tolerance < 0:
             raise ValueError("base_tolerance must be >= 0")
-        if align_method not in {"none", "phase", "phase+ecc"}:
+        if align_method not in {"none", "phase", "phase+ecc",
+                                "logpolar", "logpolar+phase"}:
             raise ValueError(f"unknown align_method '{align_method}'")
         if blur_ksize % 2 == 0 or blur_ksize < 1:
             raise ValueError("blur_ksize must be a positive odd integer")
@@ -118,7 +121,7 @@ class DynamicToleranceInspector:
         self._validate(target, ignore_mask)
 
         prepared = self._preprocess(target)
-        aligned, shift, method = self._align(prepared)
+        aligned, shift, method, rotation_deg, scale = self._align(prepared)
 
         diff = np.abs(aligned.astype(np.float32) - self.ref.master)
         threshold_map = self.base_tolerance + self.k_sigma * self.ref.tolerance
@@ -134,7 +137,8 @@ class DynamicToleranceInspector:
         return InspectionResult(
             aligned=aligned, diff=diff, threshold_map=threshold_map,
             anomaly_mask=anomaly_mask, defects=defects,
-            shift=shift, align_method=method,
+            shift=shift, rotation_deg=rotation_deg, scale=scale,
+            align_method=method,
         )
 
     # ---------- internals ------------------------------------------------
@@ -159,20 +163,28 @@ class DynamicToleranceInspector:
             return cv2.GaussianBlur(target, (self.blur_ksize, self.blur_ksize), 0)
         return target
 
-    def _align(self, target: np.ndarray) -> tuple[np.ndarray, tuple[float, float], str]:
+    def _align(self, target: np.ndarray) -> tuple[np.ndarray, tuple[float, float],
+                                                   str, float, float]:
         if self.align_method == "none":
-            return target, (0.0, 0.0), "none"
+            return target, (0.0, 0.0), "none", 0.0, 1.0
+
+        if self.align_method in {"logpolar", "logpolar+phase"}:
+            refine = self.align_method == "logpolar+phase"
+            res = align_log_polar(self.ref.master, target,
+                                  refine_translation=refine)
+            return (res.aligned, res.shift, res.method,
+                    res.rotation_deg, res.scale)
 
         phase = align_translation(self.ref.master, target)
         if self.align_method == "phase":
-            return phase.aligned, phase.shift, phase.method
+            return phase.aligned, phase.shift, phase.method, 0.0, 1.0
 
         # phase + ecc
         # Use the translation result to seed the ECC warp matrix.
         init = np.float32([[1, 0, -phase.shift[0]],
                            [0, 1, -phase.shift[1]]])
         ecc = align_ecc(self.ref.master, target, motion="euclidean", init=init)
-        return ecc.aligned, ecc.shift, f"phase+{ecc.method}"
+        return ecc.aligned, ecc.shift, f"phase+{ecc.method}", 0.0, 1.0
 
     def _morph(self, mask: np.ndarray) -> np.ndarray:
         k = cv2.getStructuringElement(cv2.MORPH_RECT,
