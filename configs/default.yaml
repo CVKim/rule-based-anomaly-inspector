@@ -1,0 +1,15 @@
+# Default hyper-parameters for the rule-based anomaly inspector.
+# All sections are optional; CLI flags override anything set here.
+
+reference:
+  blur_ksize: 5         # Gaussian blur applied before stacking
+  align: true           # phase-correlation align each sample to the first
+  dispersion: std       # 'std' (fast) or 'mad' (robust against bad samples)
+
+inspect:
+  k_sigma: 4.0          # threshold = base_tolerance + k_sigma * std
+  base_tolerance: 5.0   # gray-level floor (8-bit)
+  min_blob_area: 15     # connected components smaller than this are dropped
+  blur_ksize: 5         # must match the reference's blur
+  align_method: phase   # 'none' | 'phase' | 'phase+ecc'
+  morph_ksize: 3        # open/close kernel size

@@ -1,0 +1,16 @@
+name: anomaly-inspector
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy>=1.24
+  - opencv>=4.8
+  - pyyaml>=6.0
+  - pillow>=10.0
+  - tqdm>=4.66
+  - matplotlib>=3.8
+  - pytest>=7.4
+  - pip
+  - pip:
+      - typer[all]>=0.12

@@ -1,0 +1,68 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Project specific
+runs/
+outputs/
+logs/
+examples/output/
+*.log
+*.npy
+*.npz
+
+# Sample / heavy data — keep folder structure via .gitkeep
+assets/sample_data/normal/*
+assets/sample_data/test/*
+!assets/sample_data/normal/.gitkeep
+!assets/sample_data/test/.gitkeep
+
+# Reference artifacts produced at runtime
+reference/
+*.pkl
+*.bin
+
+# OS
+.DS_Store
