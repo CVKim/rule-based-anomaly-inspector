@@ -9,6 +9,9 @@ import cv2
 import numpy as np
 
 from .alignment import align_ecc, align_log_polar, align_translation
+from .classification import (
+    Category, ShapeFeatures, auto_unreliable_mask, classify, shape_features,
+)
 from .photometric import PhotometricCorrector
 from .reference import Reference
 from .utils import get_logger
@@ -21,6 +24,11 @@ class DefectInfo:
     centroid: tuple[float, float]
     mean_diff: float
     max_diff: float
+    category: Category = "unknown"
+    polarity: str = "dark"             # "dark" | "bright"
+    aspect_ratio: float = 1.0
+    circularity: float = 0.0
+    solidity: float = 0.0
 
 
 @dataclass
@@ -71,7 +79,13 @@ class DynamicToleranceInspector:
                  blur_ksize: int = 5,
                  align_method: str = "phase",
                  morph_ksize: int = 3,
-                 photometric: PhotometricCorrector | None = None):
+                 photometric: PhotometricCorrector | None = None,
+                 k_sigma_dark: float | None = None,
+                 k_sigma_bright: float | None = None,
+                 base_tolerance_dark: float | None = None,
+                 base_tolerance_bright: float | None = None,
+                 auto_ignore_percentile: float | None = None,
+                 classify_defects: bool = True):
         if k_sigma <= 0:
             raise ValueError("k_sigma must be > 0")
         if base_tolerance < 0:
@@ -83,6 +97,9 @@ class DynamicToleranceInspector:
             raise ValueError("blur_ksize must be a positive odd integer")
         if morph_ksize < 1:
             raise ValueError("morph_ksize must be >= 1")
+        if auto_ignore_percentile is not None and not (
+                0.0 < auto_ignore_percentile < 100.0):
+            raise ValueError("auto_ignore_percentile must be in (0, 100)")
 
         self.ref = reference
         self.k_sigma = float(k_sigma)
@@ -91,6 +108,24 @@ class DynamicToleranceInspector:
         self.blur_ksize = int(blur_ksize)
         self.align_method = align_method
         self.morph_ksize = int(morph_ksize)
+        # Asymmetric thresholds: tighten the side that matters more.  When
+        # not given, both default back to k_sigma so behaviour matches v0.1.
+        self.k_sigma_dark = float(k_sigma_dark) if k_sigma_dark is not None else self.k_sigma
+        self.k_sigma_bright = float(k_sigma_bright) if k_sigma_bright is not None else self.k_sigma
+        self.base_tolerance_dark = (
+            float(base_tolerance_dark) if base_tolerance_dark is not None
+            else self.base_tolerance
+        )
+        self.base_tolerance_bright = (
+            float(base_tolerance_bright) if base_tolerance_bright is not None
+            else self.base_tolerance
+        )
+        self.auto_ignore_percentile = (
+            float(auto_ignore_percentile)
+            if auto_ignore_percentile is not None else None
+        )
+        self.classify_defects = bool(classify_defects)
+        self._auto_ignore_cache: np.ndarray | None = None
         # Default to whatever photometric normalizer the reference was built
         # with — they MUST match, or the master and the target will live in
         # different brightness spaces.
@@ -123,16 +158,25 @@ class DynamicToleranceInspector:
         prepared = self._preprocess(target)
         aligned, shift, method, rotation_deg, scale = self._align(prepared)
 
-        diff = np.abs(aligned.astype(np.float32) - self.ref.master)
-        threshold_map = self.base_tolerance + self.k_sigma * self.ref.tolerance
-        anomaly_mask = (diff > threshold_map).astype(np.uint8) * 255
+        signed = aligned.astype(np.float32) - self.ref.master
+        diff = np.abs(signed)
 
-        if ignore_mask is not None:
-            inverse = cv2.bitwise_not(self._binarize_mask(ignore_mask))
+        # Symmetric threshold (used for the headline ``threshold_map`` field)
+        # plus split bright/dark thresholds applied during binarization.
+        threshold_map = self.base_tolerance + self.k_sigma * self.ref.tolerance
+        bright_thresh = self.base_tolerance_bright + self.k_sigma_bright * self.ref.tolerance
+        dark_thresh = self.base_tolerance_dark + self.k_sigma_dark * self.ref.tolerance
+        bright_hits = signed > bright_thresh
+        dark_hits = -signed > dark_thresh
+        anomaly_mask = ((bright_hits | dark_hits).astype(np.uint8)) * 255
+
+        full_ignore = self._combined_ignore(ignore_mask, target.shape)
+        if full_ignore is not None:
+            inverse = cv2.bitwise_not(full_ignore)
             anomaly_mask = cv2.bitwise_and(anomaly_mask, inverse)
 
         anomaly_mask = self._morph(anomaly_mask)
-        defects = self._blobs(anomaly_mask, diff)
+        defects = self._blobs(anomaly_mask, diff, signed)
 
         return InspectionResult(
             aligned=aligned, diff=diff, threshold_map=threshold_map,
@@ -193,7 +237,8 @@ class DynamicToleranceInspector:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
         return mask
 
-    def _blobs(self, mask: np.ndarray, diff: np.ndarray) -> list[DefectInfo]:
+    def _blobs(self, mask: np.ndarray, diff: np.ndarray,
+               signed: np.ndarray) -> list[DefectInfo]:
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
             mask, connectivity=8
         )
@@ -211,10 +256,27 @@ class DynamicToleranceInspector:
             vals = region[label_region]
             mean_diff = float(vals.mean()) if vals.size else 0.0
             max_diff = float(vals.max()) if vals.size else 0.0
+
+            category: Category = "unknown"
+            polarity = "dark"
+            aspect = 1.0
+            circ = 0.0
+            solidity = 0.0
+            if self.classify_defects:
+                blob_mask = ((labels == i).astype(np.uint8)) * 255
+                feats = shape_features(blob_mask, signed)
+                category = classify(feats)
+                polarity = feats.polarity
+                aspect = feats.aspect_ratio
+                circ = feats.circularity
+                solidity = feats.solidity
+
             out.append(DefectInfo(
                 bbox=(x, y, w, h), area=area,
                 centroid=(float(centroids[i, 0]), float(centroids[i, 1])),
                 mean_diff=mean_diff, max_diff=max_diff,
+                category=category, polarity=polarity,
+                aspect_ratio=aspect, circularity=circ, solidity=solidity,
             ))
         return out
 
@@ -224,3 +286,23 @@ class DynamicToleranceInspector:
             mask = mask.astype(np.uint8)
         _, bin_mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY)
         return bin_mask
+
+    def _combined_ignore(self, user_mask: Optional[np.ndarray],
+                         shape: tuple[int, int]) -> Optional[np.ndarray]:
+        """OR the user-supplied ignore mask with the auto-derived one (if on)."""
+        masks: list[np.ndarray] = []
+        if user_mask is not None:
+            masks.append(self._binarize_mask(user_mask))
+        if self.auto_ignore_percentile is not None:
+            if self._auto_ignore_cache is None:
+                self._auto_ignore_cache = auto_unreliable_mask(
+                    self.ref.tolerance,
+                    percentile=self.auto_ignore_percentile,
+                )
+            masks.append(self._auto_ignore_cache)
+        if not masks:
+            return None
+        out = masks[0]
+        for m in masks[1:]:
+            out = cv2.bitwise_or(out, m)
+        return out

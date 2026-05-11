@@ -10,11 +10,25 @@ import numpy as np
 from .inspector import DefectInfo, InspectionResult
 
 
+_CATEGORY_COLOR: dict[str, tuple[int, int, int]] = {
+    "scratch": (0, 165, 255),   # orange
+    "spot":    (0, 255, 255),   # yellow
+    "dent":    (0, 0, 255),     # red
+    "smudge":  (255, 0, 255),   # magenta
+    "unknown": (200, 200, 200), # gray
+}
+
+
 def draw_defects(image: np.ndarray, defects: Iterable[DefectInfo],
-                 color: tuple[int, int, int] = (0, 0, 255),
+                 color: tuple[int, int, int] | None = None,
                  thickness: int = 2,
                  label: bool = True) -> np.ndarray:
-    """Return a BGR copy of `image` with bounding boxes drawn for each defect."""
+    """Return a BGR copy of `image` with bounding boxes drawn for each defect.
+
+    When ``color`` is ``None`` (the default), each box is colored by the
+    defect's category for at-a-glance triage; pass an explicit color to force
+    a single hue.
+    """
     if image.ndim == 2:
         vis = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     else:
@@ -22,11 +36,12 @@ def draw_defects(image: np.ndarray, defects: Iterable[DefectInfo],
 
     for i, d in enumerate(defects, start=1):
         x, y, w, h = d.bbox
-        cv2.rectangle(vis, (x, y), (x + w, y + h), color, thickness)
+        cat_color = color or _CATEGORY_COLOR.get(d.category, (0, 0, 255))
+        cv2.rectangle(vis, (x, y), (x + w, y + h), cat_color, thickness)
         if label:
-            txt = f"#{i} A={d.area} max={d.max_diff:.0f}"
+            txt = f"#{i} {d.category}/{d.polarity} A={d.area} max={d.max_diff:.0f}"
             cv2.putText(vis, txt, (x, max(0, y - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, cat_color, 1, cv2.LINE_AA)
     return vis
 
 

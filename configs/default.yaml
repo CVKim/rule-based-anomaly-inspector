@@ -13,9 +13,15 @@ reference:
     tile_grid: 8        # CLAHE tile grid (NxN tiles)
 
 inspect:
-  k_sigma: 4.0          # threshold = base_tolerance + k_sigma * std
+  k_sigma: 4.0          # threshold = base_tolerance + k_sigma * std (symmetric default)
   base_tolerance: 5.0   # gray-level floor (8-bit)
   min_blob_area: 15     # connected components smaller than this are dropped
   blur_ksize: 5         # must match the reference's blur
-  align_method: phase   # 'none' | 'phase' | 'phase+ecc'
+  align_method: phase   # 'none' | 'phase' | 'phase+ecc' | 'logpolar' | 'logpolar+phase'
   morph_ksize: 3        # open/close kernel size
+  k_sigma_dark: null         # asymmetric override; null falls back to k_sigma
+  k_sigma_bright: null       # asymmetric override; null falls back to k_sigma
+  base_tolerance_dark: null  # asymmetric base; null falls back to base_tolerance
+  base_tolerance_bright: null
+  auto_ignore_percentile: null   # e.g. 99.0 — auto-mask high-variance pixels
+  classify_defects: true         # tag each blob as scratch / spot / dent / smudge
