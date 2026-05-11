@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from .alignment import align_translation
+from .photometric import PhotometricCorrector
 from .utils import get_logger, load_gray, stack_images
 
 
@@ -19,6 +20,7 @@ class Reference:
     tolerance: np.ndarray    # float32, H x W — per-pixel std (or MAD-derived)
     method: str              # "std" or "mad"
     n_samples: int
+    photometric: PhotometricCorrector = field(default_factory=lambda: PhotometricCorrector())
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -42,7 +44,8 @@ class ReferenceBuilder:
     def __init__(self,
                  blur_ksize: int = 5,
                  align: bool = True,
-                 dispersion: str = "std"):
+                 dispersion: str = "std",
+                 photometric: PhotometricCorrector | None = None):
         if blur_ksize % 2 == 0 or blur_ksize < 1:
             raise ValueError("blur_ksize must be a positive odd integer")
         if dispersion not in {"std", "mad"}:
@@ -50,6 +53,7 @@ class ReferenceBuilder:
         self.blur_ksize = blur_ksize
         self.align = align
         self.dispersion = dispersion
+        self.photometric = photometric or PhotometricCorrector(method="none")
         self.log = get_logger()
 
     # ---------- public ---------------------------------------------------
@@ -83,16 +87,22 @@ class ReferenceBuilder:
         master = np.median(stack, axis=0).astype(np.float32)
         tolerance = self._dispersion(stack, master)
 
-        self.log.info("built reference: shape=%s, n=%d, method=%s",
-                      master.shape, len(images), self.dispersion)
+        self.log.info("built reference: shape=%s, n=%d, dispersion=%s, photometric=%s",
+                      master.shape, len(images), self.dispersion,
+                      self.photometric.method)
         return Reference(master=master, tolerance=tolerance,
-                         method=self.dispersion, n_samples=len(images))
+                         method=self.dispersion, n_samples=len(images),
+                         photometric=self.photometric)
 
     # ---------- internals ------------------------------------------------
 
     def _preprocess(self, img: np.ndarray) -> np.ndarray:
         if img.ndim == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # Photometric normalization runs BEFORE the noise blur so the blur
+        # smooths over any small artifacts that the normalizer introduces.
+        if self.photometric.method != "none":
+            img = self.photometric.apply(img)
         if self.blur_ksize > 1:
             img = cv2.GaussianBlur(img, (self.blur_ksize, self.blur_ksize), 0)
         return img

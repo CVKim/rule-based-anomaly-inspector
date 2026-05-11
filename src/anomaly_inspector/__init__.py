@@ -3,6 +3,7 @@
 from .inspector import DynamicToleranceInspector, InspectionResult, DefectInfo
 from .reference import ReferenceBuilder, Reference
 from .alignment import align_translation, align_ecc
+from .photometric import PhotometricCorrector, flat_field_divide, top_hat, clahe
 from .visualization import draw_defects, side_by_side
 
 __all__ = [
@@ -13,8 +14,12 @@ __all__ = [
     "Reference",
     "align_translation",
     "align_ecc",
+    "PhotometricCorrector",
+    "flat_field_divide",
+    "top_hat",
+    "clahe",
     "draw_defects",
     "side_by_side",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0.dev0"
