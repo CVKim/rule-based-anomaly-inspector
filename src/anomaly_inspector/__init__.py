@@ -2,7 +2,7 @@
 
 from .inspector import DynamicToleranceInspector, InspectionResult, DefectInfo
 from .reference import ReferenceBuilder, Reference
-from .alignment import align_translation, align_ecc
+from .alignment import align_translation, align_ecc, align_log_polar, estimate_rotation_scale
 from .photometric import PhotometricCorrector, flat_field_divide, top_hat, clahe
 from .visualization import draw_defects, side_by_side
 
@@ -14,6 +14,8 @@ __all__ = [
     "Reference",
     "align_translation",
     "align_ecc",
+    "align_log_polar",
+    "estimate_rotation_scale",
     "PhotometricCorrector",
     "flat_field_divide",
     "top_hat",
