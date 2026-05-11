@@ -82,6 +82,17 @@ def run(
                                      help="'none' | 'phase' | 'phase+ecc' | "
                                           "'logpolar' | 'logpolar+phase'."),
     morph_ksize: int = typer.Option(3, "--morph-ksize"),
+    k_sigma_dark: Optional[float] = typer.Option(None, "--k-sigma-dark",
+                                                 help="Asymmetric: tighten threshold for dark anomalies."),
+    k_sigma_bright: Optional[float] = typer.Option(None, "--k-sigma-bright",
+                                                   help="Asymmetric: tighten threshold for bright anomalies."),
+    base_tolerance_dark: Optional[float] = typer.Option(None, "--base-tolerance-dark"),
+    base_tolerance_bright: Optional[float] = typer.Option(None, "--base-tolerance-bright"),
+    auto_ignore_percentile: Optional[float] = typer.Option(
+        None, "--auto-ignore-percentile",
+        help="Auto-mask pixels above this tolerance percentile (e.g. 99.0)."),
+    classify_defects: bool = typer.Option(True, "--classify/--no-classify",
+                                          help="Classify each blob as scratch/spot/dent/smudge."),
 ) -> None:
     """Inspect one image (or every image in a folder) and write overlays."""
     log = get_logger()
@@ -93,6 +104,13 @@ def run(
     blur_ksize = insp_cfg.get("blur_ksize", blur_ksize)
     align_method = insp_cfg.get("align_method", align_method)
     morph_ksize = insp_cfg.get("morph_ksize", morph_ksize)
+    k_sigma_dark = insp_cfg.get("k_sigma_dark", k_sigma_dark)
+    k_sigma_bright = insp_cfg.get("k_sigma_bright", k_sigma_bright)
+    base_tolerance_dark = insp_cfg.get("base_tolerance_dark", base_tolerance_dark)
+    base_tolerance_bright = insp_cfg.get("base_tolerance_bright", base_tolerance_bright)
+    auto_ignore_percentile = insp_cfg.get("auto_ignore_percentile",
+                                          auto_ignore_percentile)
+    classify_defects = insp_cfg.get("classify_defects", classify_defects)
 
     master, tolerance, meta = load_reference(reference)
     log.info("loaded reference: shape=%s, meta=%s", master.shape, meta)
@@ -107,6 +125,11 @@ def run(
         ref, k_sigma=k_sigma, base_tolerance=base_tolerance,
         min_blob_area=min_blob_area, blur_ksize=blur_ksize,
         align_method=align_method, morph_ksize=morph_ksize,
+        k_sigma_dark=k_sigma_dark, k_sigma_bright=k_sigma_bright,
+        base_tolerance_dark=base_tolerance_dark,
+        base_tolerance_bright=base_tolerance_bright,
+        auto_ignore_percentile=auto_ignore_percentile,
+        classify_defects=classify_defects,
     )
 
     if input.is_dir():
@@ -117,20 +140,22 @@ def run(
         raise typer.BadParameter(f"input does not exist: {input}")
 
     ensure_dir(output)
-    summary_lines = ["filename,n_defects,shift_x,shift_y,rotation_deg,scale"]
+    summary_lines = ["filename,n_defects,shift_x,shift_y,rotation_deg,scale,categories"]
     for p in paths:
         img = load_gray(p)
         result = inspector.inspect(img)
         vis = side_by_side(result, ref.master)
         out_path = output / f"{p.stem}_result.png"
         cv2.imwrite(str(out_path), vis)
-        log.info("%-40s defects=%d shift=(%.2f, %.2f) rot=%.2f scale=%.4f",
+        cat_summary = ";".join(f"{d.category}/{d.polarity}"
+                               for d in result.defects) or "-"
+        log.info("%-40s defects=%d shift=(%.2f, %.2f) rot=%.2f scale=%.4f categories=%s",
                  p.name, len(result.defects), *result.shift,
-                 result.rotation_deg, result.scale)
+                 result.rotation_deg, result.scale, cat_summary)
         summary_lines.append(
             f"{p.name},{len(result.defects)},"
             f"{result.shift[0]:.3f},{result.shift[1]:.3f},"
-            f"{result.rotation_deg:.3f},{result.scale:.5f}"
+            f"{result.rotation_deg:.3f},{result.scale:.5f},{cat_summary}"
         )
 
     (output / "summary.csv").write_text("\n".join(summary_lines), encoding="utf-8")
