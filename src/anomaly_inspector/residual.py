@@ -29,8 +29,9 @@ import cv2
 import numpy as np
 
 
-Mode = Literal["absdiff", "multiscale", "ncc", "gradient"]
-_VALID_MODES: tuple[Mode, ...] = ("absdiff", "multiscale", "ncc", "gradient")
+Mode = Literal["absdiff", "multiscale", "ncc", "gradient", "ridge", "fused"]
+_VALID_MODES: tuple[Mode, ...] = ("absdiff", "multiscale", "ncc", "gradient",
+                                  "ridge", "fused")
 
 # What an ``absdiff`` residual of "obvious defect" looks like in 8-bit units —
 # used as the reference scale when normalising NCC / gradient outputs into
@@ -59,8 +60,27 @@ class ResidualConfig:
     # sensitivity while gaining edge-defect sensitivity.
     gradient_blend: float = 0.0
 
+    # ridge (Frangi-style multi-scale Hessian tubeness)
+    ridge_scales: tuple[float, ...] = (1.0, 2.0, 4.0)
+    ridge_polarity: Literal["dark", "bright", "both"] = "dark"
+    ridge_beta: float = 0.5      # blob-vs-tube discrimination
+    ridge_c: float = 15.0        # noise threshold; higher = more conservative
+    # Spatial-dilation radius (px) for the master ridge response before
+    # subtraction. Master ridges that drift by <= this radius in the target
+    # (sub-pixel alignment slop, micro-warps) still cancel cleanly. Set 0 to
+    # disable for clean synthetic tests.
+    ridge_master_dilate: int = 3
+
+    # fused: per-pixel mean of normalised residuals across these modes.
+    # Defaults to "the three discriminative modes" so a single
+    # ResidualConfig(mode="fused") works out of the box.
+    fused_modes: tuple[Mode, ...] = ("absdiff", "ncc", "ridge")
+    fused_weights: tuple[float, ...] = ()    # empty = uniform
+
     # combine multiple residual modes by max — set to a tuple of modes to
-    # union them all. Empty = use ``mode`` only.
+    # union them all. Empty = use ``mode`` only. Distinct from ``fused_modes``:
+    # extra_modes uses MAX over **abs** residuals (catches anything any mode
+    # flagged); fused averages NORMALISED residuals (rewards mode agreement).
     extra_modes: tuple[Mode, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
@@ -78,6 +98,19 @@ class ResidualConfig:
             raise ValueError("gradient_ksize must be 1, 3, 5, or 7")
         if self.gradient_blend < 0:
             raise ValueError("gradient_blend must be >= 0")
+        if not self.ridge_scales or any(s <= 0 for s in self.ridge_scales):
+            raise ValueError("ridge_scales must be a non-empty tuple of positive floats")
+        if self.ridge_polarity not in {"dark", "bright", "both"}:
+            raise ValueError("ridge_polarity must be 'dark' | 'bright' | 'both'")
+        if self.ridge_beta <= 0 or self.ridge_c <= 0:
+            raise ValueError("ridge_beta and ridge_c must be > 0")
+        if self.ridge_master_dilate < 0:
+            raise ValueError("ridge_master_dilate must be >= 0")
+        for m in self.fused_modes:
+            if m not in _VALID_MODES or m == "fused":
+                raise ValueError(f"unknown / illegal fused mode '{m}'")
+        if self.fused_weights and len(self.fused_weights) != len(self.fused_modes):
+            raise ValueError("fused_weights length must match fused_modes")
         for m in self.extra_modes:
             if m not in _VALID_MODES:
                 raise ValueError(f"unknown extra mode '{m}'")
@@ -91,6 +124,13 @@ class ResidualConfig:
             "gradient_op": self.gradient_op,
             "gradient_ksize": int(self.gradient_ksize),
             "gradient_blend": float(self.gradient_blend),
+            "ridge_scales": [float(s) for s in self.ridge_scales],
+            "ridge_polarity": self.ridge_polarity,
+            "ridge_beta": float(self.ridge_beta),
+            "ridge_c": float(self.ridge_c),
+            "ridge_master_dilate": int(self.ridge_master_dilate),
+            "fused_modes": list(self.fused_modes),
+            "fused_weights": list(self.fused_weights),
             "extra_modes": list(self.extra_modes),
         }
 
@@ -99,6 +139,9 @@ class ResidualConfig:
         if not meta:
             return cls()
         extras = meta.get("extra_modes") or ()
+        ridge_scales = meta.get("ridge_scales") or (1.0, 2.0, 4.0)
+        fused_modes = meta.get("fused_modes") or ("absdiff", "ncc", "ridge")
+        fused_weights = meta.get("fused_weights") or ()
         return cls(
             mode=meta.get("mode", "absdiff"),
             pyramid_levels=int(meta.get("pyramid_levels", 3)),
@@ -107,8 +150,18 @@ class ResidualConfig:
             gradient_op=meta.get("gradient_op", "scharr"),
             gradient_ksize=int(meta.get("gradient_ksize", 3)),
             gradient_blend=float(meta.get("gradient_blend", 0.0)),
+            ridge_scales=tuple(float(s) for s in ridge_scales),
+            ridge_polarity=meta.get("ridge_polarity", "dark"),
+            ridge_beta=float(meta.get("ridge_beta", 0.5)),
+            ridge_c=float(meta.get("ridge_c", 15.0)),
+            ridge_master_dilate=int(meta.get("ridge_master_dilate", 3)),
+            fused_modes=tuple(fused_modes),
+            fused_weights=tuple(float(w) for w in fused_weights),
             extra_modes=tuple(extras),
         )
+
+
+_FUSABLE: tuple[Mode, ...] = ("absdiff", "multiscale", "ncc", "gradient", "ridge")
 
 
 def compute_residual(master: np.ndarray, target: np.ndarray,
@@ -164,6 +217,14 @@ def _residual_one(master: np.ndarray, target: np.ndarray,
         grad_abs = _gradient_residual(master, target, config.gradient_op,
                                       config.gradient_ksize)
         return grad_abs.copy(), grad_abs
+
+    if mode == "ridge":
+        ridge_abs = _ridge_residual(master, target, config)
+        return ridge_abs.copy(), ridge_abs
+
+    if mode == "fused":
+        fused = _fused_residual(master, target, config)
+        return fused.copy(), fused
 
     raise AssertionError(f"unhandled mode '{mode}'")  # pragma: no cover
 
@@ -281,3 +342,144 @@ def _gradient_residual(master: np.ndarray, target: np.ndarray,
     if scale_ref > 1e-3:
         diff = diff / scale_ref * _GRAY_REFERENCE_SCALE
     return diff.astype(np.float32)
+
+
+# ---------- ridge (Frangi-style multi-scale Hessian) -----------------------
+
+
+def _ridge_response(img: np.ndarray, sigma: float,
+                    beta: float, c: float,
+                    polarity: str) -> np.ndarray:
+    """Frangi tubeness at a single scale.
+
+    Computes the Hessian via Gaussian-derivative convolution, then for each
+    pixel the eigenvalues ``|lambda1| <= |lambda2|``. A line-like (tubular)
+    structure has |lambda1| ~ 0 and large |lambda2|; a blob has both large
+    and similar; flat regions both small. Vesselness:
+
+        Rb = lambda1 / lambda2          (blob-vs-line discriminator)
+        S  = sqrt(lambda1^2 + lambda2^2) (structureness — kills noise)
+        V  = exp(-Rb^2 / (2*beta^2)) * (1 - exp(-S^2 / (2*c^2)))
+
+    With sign filter on lambda2: dark line -> lambda2 > 0, bright -> < 0.
+    """
+    f = img.astype(np.float32)
+    # Gaussian smoothing for differentiation at scale sigma
+    smoothed = cv2.GaussianBlur(f, ksize=(0, 0), sigmaX=sigma, sigmaY=sigma,
+                                borderType=cv2.BORDER_REFLECT)
+    # Hessian components (sigma^2 normalisation per Lindeberg)
+    Hxx = cv2.Sobel(smoothed, cv2.CV_32F, 2, 0, ksize=3) * (sigma ** 2)
+    Hyy = cv2.Sobel(smoothed, cv2.CV_32F, 0, 2, ksize=3) * (sigma ** 2)
+    Hxy = cv2.Sobel(smoothed, cv2.CV_32F, 1, 1, ksize=3) * (sigma ** 2)
+
+    # Closed-form 2x2 eigenvalues
+    tmp = np.sqrt((Hxx - Hyy) ** 2 + 4 * Hxy ** 2 + 1e-12)
+    lam1 = 0.5 * (Hxx + Hyy - tmp)
+    lam2 = 0.5 * (Hxx + Hyy + tmp)
+
+    # Order so |lam1| <= |lam2|
+    abs1 = np.abs(lam1)
+    abs2 = np.abs(lam2)
+    swap = abs1 > abs2
+    a = np.where(swap, lam2, lam1)
+    b = np.where(swap, lam1, lam2)   # |b| >= |a|
+
+    Rb = a / (b + 1e-6)
+    S = np.sqrt(a * a + b * b)
+    V = np.exp(-(Rb * Rb) / (2 * beta * beta)) * (
+        1.0 - np.exp(-(S * S) / (2 * c * c))
+    )
+
+    if polarity == "dark":
+        V = np.where(b > 0, V, 0.0)
+    elif polarity == "bright":
+        V = np.where(b < 0, V, 0.0)
+    # both: leave as is
+    V = np.where(np.isfinite(V), V, 0.0)
+    return V.astype(np.float32)
+
+
+def _ridge_residual(master: np.ndarray, target: np.ndarray,
+                    config: ResidualConfig) -> np.ndarray:
+    """Multi-scale ridge response **difference** between target and master.
+
+    The Frangi response by itself flags every legitimate ridge in the master
+    (slot edges, machined grooves) too; subtracting the master response means
+    we only keep ridges that appeared (or strengthened) in the target —
+    i.e. crack candidates.
+    """
+    polarity = config.ridge_polarity
+    # Per-scale response for both, take per-pixel max across scales
+    def _multi_scale(img: np.ndarray) -> np.ndarray:
+        per_scale = [
+            _ridge_response(img, s, config.ridge_beta, config.ridge_c, polarity)
+            for s in config.ridge_scales
+        ]
+        return np.maximum.reduce(per_scale)
+
+    Vm = _multi_scale(master)
+    Vt = _multi_scale(target)
+
+    # Spatial-dilation cancellation: a legitimate ridge in the master that
+    # drifts by a few pixels in the target (sub-pixel alignment slop, line-
+    # scan jitter, micro-warp) would otherwise leave a residual of
+    # ``Vt - 0`` because Vm was zero at the SHIFTED location. Take the
+    # neighbourhood-max of Vm so any nearby master ridge cancels first.
+    if config.ridge_master_dilate > 0:
+        d = config.ridge_master_dilate
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                           (2 * d + 1, 2 * d + 1))
+        Vm = cv2.dilate(Vm, kernel)
+
+    diff = np.maximum(Vt - Vm, 0.0)   # only "new" ridges
+
+    # Frangi vesselness lives in [0, 1]. Rescale into the gray-level range so
+    # the dynamic-tolerance threshold's base + k_sigma * std stays meaningful.
+    diff_scaled = diff * _GRAY_REFERENCE_SCALE
+    return diff_scaled.astype(np.float32)
+
+
+# ---------- score-level fusion ---------------------------------------------
+
+
+def _fused_residual(master: np.ndarray, target: np.ndarray,
+                    config: ResidualConfig) -> np.ndarray:
+    """Per-pixel weighted mean of normalised residuals across multiple modes.
+
+    Each constituent residual is min/max-normalised on a robust percentile
+    range (1st-99th) before averaging so a single mode with a wider numeric
+    spread doesn't dominate. The result is rescaled to the gray-level
+    range so the inspector's dynamic threshold still applies.
+
+    Compared to ``extra_modes`` (per-pixel max over abs residuals), fusion
+    REWARDS mode agreement instead of taking the loudest signal: a real
+    defect tends to light up multiple modes, while mode-specific noise
+    (e.g. NCC's edge-halo noise) only fires in one — so fusion implicitly
+    cuts FPs while keeping recall.
+    """
+    # Default to "the three most discriminative" if none specified
+    modes = config.fused_modes or ("absdiff", "ncc", "ridge")
+    weights = (config.fused_weights or (1.0,) * len(modes))
+    weights = np.asarray(weights, dtype=np.float32)
+    weights = weights / weights.sum()
+
+    accum = np.zeros_like(master, dtype=np.float32)
+    for w, m in zip(weights, modes):
+        if m == "fused":
+            raise ValueError("fused mode cannot reference itself")
+        _signed, abs_r = _residual_one(master, target, m, config)
+        normed = _robust_normalise(abs_r)
+        accum += w * normed
+
+    return (accum * _GRAY_REFERENCE_SCALE).astype(np.float32)
+
+
+def _robust_normalise(arr: np.ndarray,
+                      lo_pct: float = 1.0, hi_pct: float = 99.0) -> np.ndarray:
+    """Clip to the ``[lo, hi]`` percentile band and rescale to ``[0, 1]``."""
+    lo = float(np.percentile(arr, lo_pct))
+    hi = float(np.percentile(arr, hi_pct))
+    if hi - lo < 1e-6:
+        return np.zeros_like(arr, dtype=np.float32)
+    out = (arr - lo) / (hi - lo)
+    return np.clip(out, 0.0, 1.0).astype(np.float32)

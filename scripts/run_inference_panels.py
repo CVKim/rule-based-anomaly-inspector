@@ -104,8 +104,10 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path,
                         help="Output root directory; one subdir per mode.")
     parser.add_argument("--modes", nargs="+",
-                        default=["absdiff", "multiscale", "ncc", "gradient"],
-                        choices=["absdiff", "multiscale", "ncc", "gradient"],
+                        default=["absdiff", "multiscale", "ncc", "gradient",
+                                 "ridge", "fused"],
+                        choices=["absdiff", "multiscale", "ncc", "gradient",
+                                 "ridge", "fused"],
                         help="Residual modes to sweep.")
 
     # Reference build

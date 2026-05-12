@@ -76,7 +76,7 @@ class DynamicToleranceInspector:
                  reference: Reference,
                  k_sigma: float = 4.0,
                  base_tolerance: float = 5.0,
-                 min_blob_area: int = 15,
+                 min_blob_area: int = 30,
                  blur_ksize: int = 5,
                  align_method: str = "phase",
                  morph_ksize: int = 3,
