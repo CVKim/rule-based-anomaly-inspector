@@ -23,7 +23,8 @@ reference:
 inspect:
   k_sigma: 4.0          # threshold = base_tolerance + k_sigma * std (symmetric default)
   base_tolerance: 5.0   # gray-level floor (8-bit)
-  min_blob_area: 15     # connected components smaller than this are dropped
+  min_blob_area: 30     # connected components smaller than this are dropped
+                        # (was 15 in v0.1; raised to 30 for crack-floor headroom)
   blur_ksize: 5         # must match the reference's blur
   align_method: phase   # 'none' | 'phase' | 'phase+ecc' | 'logpolar' | 'logpolar+phase'
   morph_ksize: 3        # open/close kernel size
