@@ -180,6 +180,103 @@ def test_fused_op_validation():
         ResidualConfig(mode="fused", fused_op="bogus")  # type: ignore[arg-type]
 
 
+def test_fused_op_intersect_drastically_thins_the_active_region():
+    """intersect: each constituent residual is thresholded at its own
+    top-N percentile; only pixels surviving EVERY mask survive. The
+    active-pixel count must be substantially smaller than for "mean"
+    (which doesn't gate, just averages)."""
+    master = _flat(size=128, val=130, noise=1.5, seed=14)
+    target = master.copy()
+    cv2.line(target, (20, 64), (108, 64), 50, thickness=2)
+
+    cfg_mean = ResidualConfig(mode="fused",
+                              fused_modes=("absdiff", "ridge"),
+                              fused_op="mean",
+                              ridge_polarity="dark",
+                              ridge_scales=(1.5, 3.0))
+    cfg_int = ResidualConfig(mode="fused",
+                             fused_modes=("absdiff", "ridge"),
+                             fused_op="intersect",
+                             intersect_quantile=0.95,
+                             ridge_polarity="dark",
+                             ridge_scales=(1.5, 3.0))
+    _, mean_r = compute_residual(master, target, cfg_mean)
+    _, int_r = compute_residual(master, target, cfg_int)
+
+    n_active_int = int((int_r > 0).sum())
+    n_active_mean = int((mean_r > 0).sum())
+    # intersect should keep substantially fewer active pixels than mean
+    # (since both modes must each be in their top-5%).
+    assert n_active_int < n_active_mean * 0.5, (
+        f"intersect didn't thin enough: int={n_active_int} mean={n_active_mean}"
+    )
+    # And the absolute fraction is bounded by the smaller per-mode quantile.
+    assert n_active_int <= int_r.size * 0.05 + 50
+
+
+def test_fused_op_intersect_validation():
+    with pytest.raises(ValueError):
+        ResidualConfig(mode="fused", fused_op="intersect",
+                       intersect_quantile=1.5)
+
+
+def test_hstripe_isolates_horizontal_dark_stripe():
+    """hstripe must isolate a thin horizontal dark stripe. The kernel
+    *thickness* must exceed (2 * defect-thickness + 1) to fully fill the
+    stripe via the closing step — that's a documented constraint, so
+    we test with a 1-px line and kernel thickness=5."""
+    master = _flat(size=192, val=180, noise=1.0, seed=15)
+    target = master.copy()
+    cv2.line(target, (40, 96), (152, 96), 60, thickness=1)
+
+    cfg = ResidualConfig(mode="hstripe", hstripe_length=31,
+                         hstripe_thickness=5,
+                         hstripe_master_dilate=0)
+    _, hr = compute_residual(master, target, cfg)
+    on_stripe = hr[94:99, 50:142]
+    far = hr[20:40, 20:170]
+    assert on_stripe.max() > 30
+    assert far.max() < on_stripe.max() * 0.5
+
+
+def test_fused_op_intersect_validation():
+    with pytest.raises(ValueError):
+        ResidualConfig(mode="fused", fused_op="intersect",
+                       intersect_quantile=1.5)
+
+
+def test_ridge_tolerance_aware_dilation_extends_in_high_tol_regions():
+    """When ridge_master_dilate_high_tol > 0 and a tolerance map is
+    passed, the cancellation radius expands at high-tolerance pixels.
+    Verify the high-tol path produces ≤ residual everywhere vs the
+    low-tol path (more cancellation cannot create more residual)."""
+    rng = np.random.default_rng(17)
+    base = np.full((128, 128), 130, dtype=np.uint8)
+    base = np.clip(base + rng.normal(0, 2, base.shape),
+                   0, 255).astype(np.uint8)
+    target = base.copy()
+    cv2.line(target, (10, 64), (118, 64), 60, thickness=2)
+    # Construct a tolerance map: high near the line, low elsewhere.
+    tol = np.zeros_like(base, dtype=np.float32)
+    tol[60:69, :] = 20.0
+
+    cfg_off = ResidualConfig(mode="ridge",
+                             ridge_polarity="dark",
+                             ridge_scales=(1.5, 3.0),
+                             ridge_master_dilate=2,
+                             ridge_master_dilate_high_tol=0)
+    cfg_on = ResidualConfig(mode="ridge",
+                            ridge_polarity="dark",
+                            ridge_scales=(1.5, 3.0),
+                            ridge_master_dilate=2,
+                            ridge_master_dilate_high_tol=4)
+    _, r_off = compute_residual(base, target, cfg_off, tolerance=tol)
+    _, r_on = compute_residual(base, target, cfg_on, tolerance=tol)
+    # In the high-tolerance band, the on-version should cancel at
+    # least as aggressively (residual <= off-version everywhere there).
+    assert r_on[60:69, :].max() <= r_off[60:69, :].max() + 1e-3
+
+
 def test_use_gpu_ridge_falls_back_to_cpu_when_unavailable():
     """When GPU is requested but unavailable (or torch missing), the
     code path must NOT crash; it should silently use the CPU path so

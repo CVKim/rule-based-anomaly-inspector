@@ -76,7 +76,8 @@ def cached_residual(ref, prepared_target: np.ndarray, aligned: np.ndarray,
     is expected to iterate modes in the outer loop and re-call this once
     per image."""
     cfg = ResidualConfig(mode=mode, **res_kwargs)            # type: ignore[arg-type]
-    return compute_residual(ref.master, aligned.astype(np.float32), cfg)
+    return compute_residual(ref.master, aligned.astype(np.float32), cfg,
+                            tolerance=ref.tolerance)
 
 
 def quick_threshold_blob(signed: np.ndarray, diff: np.ndarray,
