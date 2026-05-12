@@ -97,8 +97,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--normal", required=True, type=Path,
-                        help="Folder of known-good (normal) images.")
+    parser.add_argument("--normal", required=True, type=Path, nargs="+",
+                        help="One or more folders of known-good (normal) images. "
+                             "All images are concatenated into a single reference.")
     parser.add_argument("--test", required=True, type=Path,
                         help="Folder of images to inspect.")
     parser.add_argument("--output", required=True, type=Path,
@@ -164,12 +165,17 @@ def main() -> None:
     log.info("test:   %s", args.test)
     log.info("modes:  %s", ", ".join(args.modes))
 
-    if not args.normal.exists():
-        raise SystemExit(f"normal folder not found: {args.normal}")
+    for nd in args.normal:
+        if not nd.exists():
+            raise SystemExit(f"normal folder not found: {nd}")
     if not args.test.exists():
         raise SystemExit(f"test folder not found: {args.test}")
 
-    normal_paths = list_images(args.normal)
+    normal_paths: list[Path] = []
+    for nd in args.normal:
+        nd_paths = list_images(nd)
+        log.info("  normal source %s: %d images", nd, len(nd_paths))
+        normal_paths.extend(nd_paths)
     test_paths = list_images(args.test)
     if not normal_paths:
         raise SystemExit(f"no images in {args.normal}")

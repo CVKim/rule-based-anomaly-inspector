@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.5.1
+
+`--normal` now accepts multiple folders so the reference can be built
+from disparate captures without flattening them into one directory:
+
+```bash
+python scripts/evaluate.py --normal good_run_a good_run_b borderline ...
+```
+
+Same change in ``scripts/evaluate.py``, ``scripts/tune.py``,
+``scripts/run_inference_panels.py``. Also fixed a JSON-serialisation
+crash in ``evaluate.py`` when ``--normal`` was passed as a list of Paths.
+
+### Empirical finding (FOOSUNG side-view, 6 NG + 4 OK)
+
+Tested four reference-build configurations on the same test+GT set:
+
+| run | normals  | k_sigma | mode  | F1     | Recall | hardFP/img | TN/FP |
+|-----|----------|---------|-------|--------|--------|------------|-------|
+| v5  | 12 (260420 only) | 4.5 | ridge | **0.084** | 0.739  | 45.5       | 0/2   |
+| v5  | 12 (260420 only) | 4.5 | fused | 0.050  | **0.783** | 85.2       | 0/2   |
+| v6  | 32 (+260417 +한도불량) | 4.5 | ridge | 0      | 0      | **0.75**   | **1**/1 |
+| v7  | 32 (+260417 +한도불량) | 2.5 | ridge | 0      | 0      | 1.75       | 0/2   |
+| v8  | 22 (260420 + 260417) | 3.5 | ridge | 0.038  | 0.696  | 100.1      | 0/2   |
+
+**Adding more "normals" hurts performance when sources don't share
+imaging conditions.** Two distinct failure modes:
+
+1. **Cross-capture-session normals (v8: 260417 + 260420)** introduce
+   sub-pixel alignment ghosting in the median master. Ridge difference
+   then fires everywhere along the part edges → 2× more FPs than v5
+   while bbox-recall stays roughly flat.
+2. **Borderline-defect "한도불량" normals (v6/v7)** include patterns
+   that look like real CRACK GTs. The per-pixel std blows up enough
+   that even k_sigma=2.5 doesn't fire on real cracks → 0 recall at
+   any threshold.
+
+Operationally interesting: v6 ridge with k=4.5 + 32 normals was the
+**only configuration where image-level classification got TN ≥ 1**
+(it correctly let one OK image through). The added tolerance absorbed
+the natural variation that was previously causing OK images to be
+flagged. But the same wider tolerance hides real cracks → only useful
+as a pure noise-reduction baseline.
+
+### Recommendations now in the README
+
+- Use a **single-session reference** by default. Multiple folders
+  helps only when they share imaging session + alignment.
+- Treat "한도불량 / borderline" samples as **test images with expected
+  pass**, NOT reference normals.
+- Cross-session normals require either (a) explicit re-alignment to a
+  common anchor before stacking, or (b) one reference per session
+  with a routing layer at inspect time.
+
 ## v0.5.0
 
 GPU-accelerated ridge filter, polygon GT support with pixel-level metrics,
