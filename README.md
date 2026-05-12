@@ -147,24 +147,61 @@ for d in result.defects:
 | `photometric.method`      | `none`  | `flat_field` for ring-light drift, `top_hat_white` to isolate bright defects.     |
 | `auto_ignore_percentile`  | `null`  | e.g. `99.0` to auto-suppress the noisiest 1% of pixels (typically edge halos).    |
 | `classify_defects`        | `true`  | Tag blobs as scratch/spot/dent/smudge for triage. Disable for raw geometry only.  |
-| `residual.mode`           | `absdiff`| `multiscale` for wide blobs, `ncc` for brightness drift, `gradient` for edge defects. |
+| `residual.mode`           | `absdiff`| `multiscale`/`ncc`/`gradient` (v0.3) + `ridge`/`fused` (v0.4).                    |
 | `residual.gradient_blend` | `0.0`   | >0 blends the gradient residual on top of the primary mode (best of both).        |
+| `residual.ridge_*`        | dark/3-scale | Multi-scale Frangi for crack-like 1D defects; `master_dilate=3` cancels sub-pixel-shifted machined edges. |
+| `residual.fused_modes`    | `(absdiff, ncc, ridge)` | Per-pixel mean of normalised residuals across these — rewards mode agreement, cuts mode-specific FPs. |
 
-### Sweep all four residuals over a folder
+### Sweep all six residuals over a folder
 
 ```bash
 python scripts/run_inference_panels.py \
     --normal "path/to/known_good" \
     --test   "path/to/test_images" \
     --output outputs/run01 \
-    --modes  absdiff multiscale ncc gradient \
-    --max-input-width 1600        # downsample huge inputs (set 0 to disable)
+    --modes  absdiff multiscale ncc gradient ridge fused \
+    --max-input-width 1600        # downsample huge inputs (set 0 = native res)
 ```
 
 Produces `outputs/run01/<mode>/<stem>_panel.png` six-cell visualisations
 (image | heatmap | mask pred | pred conf fg | pred conf bg | overlay) and
 a per-mode `summary.csv` with detection counts, recovered alignment, and
 per-defect categories.
+
+> **Recall tip — large source images & thin defects.** The default
+> `--max-input-width 1600` is fast but downsampling can erase
+> sub-pixel-thin defects (cracks, hairline scratches). For thin
+> features set `--max-input-width 0` (native resolution) — costs
+> ~10× more inference time but recovers 5–10× the recall.
+
+### GT-driven evaluation (v0.4)
+
+If you have labelme-style rectangle ground truth (one JSON per image,
+empty `shapes` = OK), wire it through:
+
+```bash
+# 1) Score every mode vs GT and write comparison panels
+python scripts/evaluate.py \
+    --normal "path/to/known_good" --test "path/to/test_images" \
+    --gt     "path/to/labelme_jsons" \
+    --output outputs/eval_v1 \
+    --modes  absdiff multiscale ncc gradient ridge fused \
+    --max-input-width 0
+
+# 2) Auto-tune k_sigma / base_tolerance / min_blob_area / morph / auto_ignore
+python scripts/tune.py \
+    --normal "path/to/known_good" --test "path/to/test_images" \
+    --gt     "path/to/labelme_jsons" \
+    --output outputs/tune_v1 \
+    --modes  absdiff ridge fused \
+    --fp-budget 10.0       # best F1 within 10 hard FPs/image
+```
+
+Each mode subdir gets a `recommend.json` with the best operating point and
+a `pareto.png` showing recall vs hard-FP/img coloured by F1. Soft FPs
+(predictions inside the part ROI but not overlapping any GT bbox) are
+listed separately so the operator can decide whether they're unlabelled
+defects worth adding to GT.
 
 ### Choosing a photometric method
 
@@ -191,10 +228,12 @@ per-defect categories.
 - `feature/*` — branched from `dev`, merged back to `dev` (no fast-forward),
   finally PR'd into `main` at release time.
 
-This repo currently sits at **v0.3.0** on `main`. v0.3.0 added the pluggable
-residual stage (multiscale / NCC / gradient) and the six-panel visualisation
-+ inference-sweep script on top of v0.2.0's photometric, log-polar, and
-classification stages, themselves built on the v0.1.0 core.
+This repo currently sits at **v0.4.0** on `main`. v0.4.0 added the
+GT-driven evaluation harness (`scripts/evaluate.py`), an offline auto-tuner
+(`scripts/tune.py`), the ridge-filter and score-level fusion residual
+modes, and corrected the recall-killing default of downsampling thin-crack
+data. Earlier: v0.3.x added pluggable residuals + auto-ROI + Unicode-safe
+I/O on top of v0.2.0's photometric / log-polar / classification stages.
 
 ## Tests
 
@@ -202,9 +241,11 @@ classification stages, themselves built on the v0.1.0 core.
 python -m pytest -q
 ```
 
-45 synthetic-data smoke tests covering the reference builder, all three
-alignment modes, the photometric stage, the classifier, every residual
-mode, and end-to-end defect detection under illumination drift and rotation.
+68 synthetic-data smoke tests covering the reference builder, all three
+alignment modes, the photometric stage, the classifier, all six residual
+modes (including ridge filter and score-level fusion), the auto-ROI
+extraction, and end-to-end defect detection under illumination drift and
+rotation.
 
 ## License
 

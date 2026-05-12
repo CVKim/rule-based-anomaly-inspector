@@ -8,6 +8,10 @@ from .photometric import PhotometricCorrector, flat_field_divide, top_hat, clahe
 from .residual import ResidualConfig, compute_residual
 from .roi import RoiConfig, auto_part_roi
 from .panel import make_panel
+from .evaluation import (
+    GtBox, GtImage, ModeReport, evaluate_image, load_gt_folder,
+    load_labelme_json, mode_complementarity,
+)
 from .visualization import draw_defects, side_by_side
 
 __all__ = [
@@ -36,4 +40,4 @@ __all__ = [
     "side_by_side",
 ]
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"

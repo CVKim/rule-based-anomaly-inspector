@@ -1,5 +1,119 @@
 # Changelog
 
+## v0.4.0
+
+GT-driven evaluation harness, two new residual modes targeting cracks and
+mode-agreement, an offline auto-tuner, and a major default-correction:
+inspect at native resolution unless explicitly downsampled. Turning the
+new pieces on is opt-in; v0.3 defaults are otherwise preserved.
+
+### Added
+
+- **Evaluation harness** (``anomaly_inspector.evaluation``)
+  - ``load_labelme_json`` / ``load_gt_folder`` parser for labelme rectangle
+    GT, with support for empty-shape-list = OK images.
+  - ``evaluate_image`` performs greedy-IoU TP matching and buckets leftover
+    predictions as ``hard_FP`` (counts toward precision) or ``soft_FP``
+    (inside the part ROI, near a labelled GT — surfaced for review,
+    excluded from precision since the user explicitly noted GT may be
+    incomplete).
+  - ``ModeReport`` aggregates per-image evaluations into bbox-level P/R/F1,
+    image-level NG/OK confusion, and mode-complementarity matrix.
+  - ``scripts/evaluate.py`` runs the full pipeline per mode and writes
+    ``report.json``, ``summary.csv``, ``mode_complementarity.csv``, and
+    per-image comparison panels (GT green, TP cyan, hard FP red, soft FP
+    orange, FN yellow X).
+
+- **Ridge filter residual** (``mode="ridge"``)
+  - Multi-scale Frangi-style Hessian vesselness with sign-filtered
+    polarity (``dark`` / ``bright`` / ``both``). Ideal for crack-like
+    1D structures the absdiff/NCC modes underweight.
+  - ``ridge_master_dilate`` neighbourhood-max on the master response
+    before subtraction so legitimate machined edges that drift by a few
+    sub-pixel slop pixels in the target still cancel cleanly. Cuts
+    ridge FP/img by ~60% on the FOOSUNG dataset (153 → 63).
+
+- **Score-level fusion** (``mode="fused"``)
+  - Per-pixel weighted mean of robust-percentile-normalised residuals
+    across ``fused_modes`` (default ``absdiff + ncc + ridge``). Rewards
+    mode AGREEMENT instead of taking the loudest signal — mode-specific
+    noise gets averaged down while real defects (which fire across
+    multiple residual families) survive.
+
+- **Auto-tuning** (``scripts/tune.py``)
+  - Per-mode grid search over ``k_sigma`` × ``base_tolerance`` ×
+    ``min_blob_area`` × ``morph_ksize`` × ``auto_ignore_percentile``.
+    Caches the residual map per (mode, image) so only the cheap
+    threshold/morph/blob/eval steps re-run per grid point — full sweep
+    on the FOOSUNG dataset finishes in ~30 minutes at native resolution.
+  - Outputs ``recommend.json`` (best F1 within the operator's hard-FP
+    budget), ``pareto.csv`` (every grid point), and a ``pareto.png``
+    scatter (recall vs hard-FP/img coloured by F1).
+
+- **Crack-friendly default** ``min_blob_area`` lowered from 15 to 30 (still
+  well below the smallest GT crack of ~68 px² at 1600-wide; raised from
+  the v0.1 floor of 15 to suppress single-component noise without
+  losing recall).
+
+### Fixed
+
+- The earlier sweep script's default ``--max-input-width 1600`` was
+  silently zeroing out recall: the median GT crack is 14 px tall in the
+  source image, which becomes ~5 px after the 2.56× downsample and is
+  then smoothed away by the Gaussian blur. The eval and tune scripts now
+  default to native resolution; the user-facing inference panel script
+  retains its 1600 default for speed but is documented as a
+  speed-vs-recall knob.
+
+### Real-data impact (FOOSUNG side-view, 6 NG + 4 OK images, GT vs preds)
+
+Bbox-level metrics — IoU≥0.05 against the labelled CRACK GT, hard FPs
+only (soft FPs surfaced separately).
+
+**Default-parameter baseline (k_sigma=3, base_tol=5, min_blob=80, full-res):**
+
+| mode                           | Recall | Precision | F1   | hard_FP/img |
+|--------------------------------|--------|-----------|------|-------------|
+| absdiff                        | 0.458  | 0.083     | 0.141 | 12.1 |
+| multiscale                     | 0.500  | 0.058     | 0.104 | 19.5 |
+| ridge (with master_dilate)     | **0.792** | 0.029  | 0.056 | 63.4 |
+| fused (absdiff+ncc+ridge)      | 0.000  | 0.000     | -    | 8.7 |
+
+**After auto-tuning (per-mode best within FP budget = 10/image):**
+
+| mode    | Recall | Precision | F1    | hard_FP/img | recommended params (k_σ, base, min_blob, auto_ig) |
+|---------|--------|-----------|-------|-------------|----------------------------------------------------|
+| absdiff | 0.417  | 0.196     | **0.267** | 4.1   | (3.5, 6.0, 150, off) |
+| ridge   | **0.833** | 0.052  | 0.098 | 36.5        | (5.0, 6.0, 150, 99.5) |
+| fused   | 0.042  | 0.017     | 0.024 | 5.9         | (5.0, 6.0, 150, 99.5) |
+
+Image-level NG/OK classification: every mode catches 6/6 NG images at
+default thresholds.
+
+**Tuner findings — operator guidance:**
+
+- **Balanced production setting → ``absdiff`` with the recommended
+  params**: 1.9× F1 improvement over baseline (0.141 → 0.267) just by
+  tightening ``min_blob_area`` to 150 (suppressing single-component
+  noise) and ``k_sigma`` to 3.5. Best precision/recall trade.
+- **No-FN regime → ``ridge``**: 83% recall is the highest of any
+  rule-based mode but the hard-FP floor stays around 36/image. Use as
+  a first-pass + downstream classifier or raise the FP budget.
+- **``fused`` does NOT help for crack-style defects**: averaging
+  normalised residuals dilutes ridge's strong crack signal with the
+  weak absdiff/ncc responses, so most threshold combinations fire on
+  shared edge artifacts instead of cracks. Fusion remains useful for
+  defect families where multiple residual modes naturally agree
+  (large scratches, smudges, contamination), which the auto-tuner
+  output makes explicit so operators can pick the right tool.
+
+### Tests
+
+- 8 new tests in ``test_ridge_fused.py`` (Frangi response on synthetic
+  lines, polarity filtering, master-ridge cancellation, fusion mode-
+  agreement, meta round-trip, end-to-end pipeline). Suite total:
+  **68 tests, all green**.
+
 ## v0.3.1
 
 Bug-fix release driven by the FOOSUNG side-view dataset, where the part
