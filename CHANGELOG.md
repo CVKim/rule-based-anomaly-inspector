@@ -1,5 +1,164 @@
 # Changelog
 
+## v0.5.0
+
+GPU-accelerated ridge filter, polygon GT support with pixel-level metrics,
+agreement (geometric-mean) fusion, and a Markdown report generator.
+
+### Added
+
+- **Polygon GT support** (``GtBox.polygon`` + ``rasterise``)
+  - ``load_labelme_json`` parses both ``rectangle`` and ``polygon`` shapes;
+    polygons get an axis-aligned bbox derived from vertex extents AND
+    keep the vertex list for true pixel-IoU.
+  - New ``polygon_iou(gt, pred_bbox, h, w)`` helper, plus
+    ``--polygon-iou`` flag on ``evaluate.py`` / ``tune.py`` to use it
+    during matching.
+
+- **Pixel-level metrics** (``PixelMetrics`` + ``pixel_metrics``)
+  - IoU / Dice / pixel-recall / pixel-precision aggregated across all
+    NG images, surfaced automatically by ``scripts/evaluate.py`` whenever
+    polygon GT is present. Reported in ``report.json`` and as new
+    ``pix_IoU/pix_Dice/pix_recall/pix_prec`` columns in ``summary.csv``.
+
+- **Comparison panels draw polygon outlines**
+  - When polygon GT is loaded the green GT outline is the actual polygon
+    contour (not the loose axis-aligned bbox), so operators can
+    immediately tell whether a "TP" really overlaps the crack.
+
+- **Torch CUDA path for the multi-scale Frangi ridge filter**
+  (``anomaly_inspector.gpu.torch_ridge_response``)
+  - All Hessian convolutions, eigenvalue decomposition, vesselness
+    aggregation, and per-scale max stay on the GPU. Numerically
+    equivalent to the CPU path (cv2.Sobel ksize=3 second-order
+    kernels matched explicitly, sigma**2 normalisation preserved).
+  - **~25-50× speedup** on an RTX 3080 vs the OpenCV CPU path
+    (12 MP image: 50s → 2-4s including the master-image pass).
+  - Wired via ``ResidualConfig.use_gpu_ridge`` and ``--gpu-ridge``
+    on the eval / sweep / tune scripts. Silent fallback to CPU when
+    torch is missing or CUDA isn't available, so config files stay
+    portable.
+
+- **OpenCL UMat helper** (``anomaly_inspector.gpu.GpuContext``)
+  - Thin layer over cv2.UMat for the rest of the residual stages
+    (gradient, NCC, multiscale). Empirically slower than CPU on this
+    workload because of host↔device transfer overhead, so off by
+    default; exposed via ``ResidualConfig.use_opencl`` for users on
+    different hardware to benchmark.
+
+- **Agreement fusion** (``ResidualConfig.fused_op="agree"``)
+  - Per-pixel weighted geometric mean (``exp(Σ w_i log(r_i))``) of
+    constituent residuals. Bounded above by the arithmetic mean (the
+    "mean" op), so where one mode is silent the agree map collapses
+    toward zero — that's the FP-suppression property. Where multiple
+    modes agree, the score is comparable to the arithmetic mean.
+
+- **Markdown report generator** (``scripts/report_metrics.py``)
+  - Reads one or more ``report.json`` files and emits a single
+    ``report.md`` with run metadata, bbox- and image-level metric
+    tables, pixel metrics, and per-image breakdowns. Use to diff runs
+    or share results without spreadsheet handling.
+
+- **Side-by-side comparison script** (``scripts/compare_eval.py``)
+  - Console + ``compare.csv`` aligning Rect-GT vs Polygon-GT eval
+    runs (same prediction set, two different GT label kinds). Useful
+    when the labeller drops both rectangle and polygon variants.
+
+### Changed
+
+- ``GtBox.rasterise`` and ``pixel_metrics`` switched from numpy slicing
+  (exclusive end) to ``cv2.rectangle`` / ``cv2.fillPoly`` (inclusive
+  boundary) so a perfect polygon-vs-rectangle overlap reports IoU = 1
+  instead of 1 - off-by-one.
+
+### Real-data results (FOOSUNG side-view, 6 NG + 4 OK images)
+
+Best balanced operating point and best-recall operating point are
+genuinely different products — published both:
+
+| run                       | mode    | F1    | Recall (bbox) | hardFP/img | Pix IoU | Pix recall |
+|---------------------------|---------|-------|---------------|------------|---------|------------|
+| 2400 wide (Polygon GT)    | absdiff | **0.261** | 0.261 | **2.12** | 0.179 | 0.242 |
+| 2400 wide (Polygon GT)    | ridge   | 0.127 | 0.542         | 20.88      | 0.106 | 0.408 |
+| Full-res GPU (v4)         | ridge   | 0.077 | 0.739         | 50.0       | 0.108 | 0.514 |
+| Full-res GPU agree (v4)   | fused   | 0.047 | **0.783**     | 90.0       | 0.080 | **0.589** |
+| Full-res GPU+autoignore (v5) | ridge | 0.084 | 0.739       | 45.5       | 0.114 | 0.510 |
+| Full-res GPU+autoignore (v5) | fused | 0.050 | **0.783**   | 85.25      | 0.083 | 0.553 |
+
+**Operator guidance** (also written into ``outputs/REPORT.md``):
+
+- Default production setting — **absdiff at 2400-wide** with
+  ``min_blob_area=60``, ``k_sigma=3.0``, ``base_tolerance=5.0``: best
+  bbox F1 (0.261), best precision-per-cost, ~2 hard FP/image.
+- "No-FN" regime — **agree fusion of (absdiff, ridge) at full-res with
+  GPU**: catches **78% of GT cracks** (vs 26% for absdiff) and **59%
+  of GT pixels**, but emits ~85-90 hard FPs/image — usable as a
+  first-pass with downstream classifier or visual review.
+- Image-level NG/OK accuracy is **6/6 NG correct** at every operating
+  point but **2/4 OK images (#1, #11) are over-flagged** at every
+  setting; that's a fundamental limit of comparing single rotations
+  against a single reference and would require multi-rotation
+  consensus to fix.
+
+### Tests
+
+- 18 new tests across ``test_evaluation.py`` (10) and
+  ``test_ridge_fused.py`` (4 new for fused_op variants and GPU
+  fallback). Suite total: **95 tests, all green**.
+
+## v0.4.1
+
+Polygon GT support driven by the FOOSUNG side-view dataset's
+``2026-05-12_Polygon`` annotations sitting alongside the original
+rectangles. Polygon GT areas are typically half the rectangle area for
+thin/diagonal cracks (the rectangle bounding box overestimates by 2-5×
+on diagonals), which lets the evaluator score predictions much more
+honestly.
+
+### Added
+
+- **Polygon parsing in ``load_labelme_json``**
+  - ``GtBox`` now carries an optional ``polygon`` field with the original
+    vertex list. ``rasterise(h, w)`` fills the polygon (or rectangle) on
+    a uint8 mask via ``cv2.fillPoly`` / ``cv2.rectangle`` so the boundary
+    convention matches across both shape sources.
+
+- **``polygon_iou(gt_box, pred_bbox, image_h, image_w)``**
+  - True polygon IoU between a (possibly polygonal) GT and an
+    axis-aligned predicted bbox via mask intersection. Pass
+    ``--polygon-iou`` to ``evaluate.py`` / ``tune.py`` to use it during
+    matching.
+
+- **``PixelMetrics`` + ``pixel_metrics`` helper**
+  - Pixel-level intersection / union / Dice / pixel-recall /
+    pixel-precision aggregated over all NG images in a run, surfaced
+    automatically by ``scripts/evaluate.py`` whenever the GT folder
+    contains polygons. Reported in both ``report.json`` and
+    ``summary.csv`` (extra columns ``pix_IoU``, ``pix_Dice``,
+    ``pix_recall``, ``pix_prec``).
+
+- **Polygon-aware comparison panels**
+  - ``scripts/evaluate.py`` now draws the polygon contour in green
+    instead of the loose axis-aligned bbox when polygons are present —
+    much easier to see whether a "TP" prediction actually overlaps the
+    crack vs just sitting in the same general area.
+
+### Changed
+
+- ``GtBox.rasterise`` and ``pixel_metrics`` use ``cv2.rectangle`` /
+  ``cv2.fillPoly`` consistently so the boundary-pixel convention matches.
+  Without this, a perfect polygon-vs-rectangle overlap would have
+  reported IoU < 1 due to the off-by-one between numpy slicing
+  (exclusive) and OpenCV fill (inclusive).
+
+### Tests
+
+- 8 new tests in ``test_evaluation.py`` covering polygon parsing,
+  vertex-count guard, mixed rect+polygon shapes, ``GtBox.rasterise``,
+  ``polygon_iou`` (vs ``bbox_iou`` for both axis-aligned and diagonal
+  cases), and ``pixel_metrics`` perfect / no-overlap / mismatch.
+  Suite total: **91 tests, all green**.
+
 ## v0.4.0
 
 GT-driven evaluation harness, two new residual modes targeting cracks and

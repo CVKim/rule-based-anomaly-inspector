@@ -170,6 +170,9 @@ def main() -> None:
     parser.add_argument("--fp-budget", type=float, default=10.0,
                         help="Pareto recommendation: best F1 among configs "
                              "with hard_FP/img <= this.")
+    parser.add_argument("--polygon-iou", action="store_true",
+                        help="Use polygon-IoU for matching when GT polygons "
+                             "are present (slower but more accurate).")
 
     args = parser.parse_args()
     log = get_logger()
@@ -307,6 +310,7 @@ def main() -> None:
                     iou_threshold=args.iou_threshold,
                     soft_fp_max_centre_distance=args.soft_fp_distance_px,
                     roi_mask=ref.roi_mask, pred_scale=pred_scale,
+                    use_polygon_iou=args.polygon_iou,
                 )
                 rep.per_image.append(ev)
             row = {
