@@ -74,6 +74,10 @@ def make_inspector(ref, mode: str, args) -> DynamicToleranceInspector:
         use_gpu_ridge=args.gpu_ridge,
         fused_op=args.fused_op,               # type: ignore[arg-type]
         fused_modes=tuple(args.fused_modes),  # type: ignore[arg-type]
+        intersect_quantile=args.intersect_quantile,
+        ridge_master_dilate_high_tol=args.ridge_master_dilate_high_tol,
+        hstripe_length=args.hstripe_length,
+        hstripe_thickness=args.hstripe_thickness,
     )
     return DynamicToleranceInspector(
         ref,
@@ -189,13 +193,19 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--modes", nargs="+",
                         default=["absdiff", "multiscale", "ncc", "gradient",
-                                 "ridge", "fused"],
+                                 "ridge", "hstripe", "fused"],
                         choices=["absdiff", "multiscale", "ncc", "gradient",
-                                 "ridge", "fused"])
+                                 "ridge", "hstripe", "fused"])
 
     parser.add_argument("--photometric", default="flat_field",
                         choices=["none", "flat_field", "top_hat_white",
                                  "top_hat_black", "clahe"])
+    parser.add_argument("--ref-align-method", default="phase",
+                        choices=["phase", "phase+ecc"],
+                        help="Alignment used when stacking normals into "
+                             "the reference. 'phase+ecc' is robust to "
+                             "cross-session rotation/warp; 'phase' is "
+                             "the v0.1 default.")
     parser.add_argument("--photo-sigma", type=float, default=51.0)
     parser.add_argument("--dispersion", default="mad", choices=["std", "mad"])
     parser.add_argument("--ref-blur", type=int, default=5)
@@ -223,10 +233,18 @@ def main() -> None:
                         help="Run the ridge filter on torch CUDA when "
                              "available (~25-50x faster).")
     parser.add_argument("--fused-op", default="mean",
-                        choices=["mean", "max", "agree"],
+                        choices=["mean", "max", "agree", "intersect"],
                         help="How to combine constituent residuals in fused mode.")
     parser.add_argument("--fused-modes", nargs="+",
                         default=["absdiff", "ncc", "ridge"])
+    parser.add_argument("--intersect-quantile", type=float, default=0.99,
+                        help="For fused_op=intersect: per-mode top-N "
+                             "percentile threshold.")
+    parser.add_argument("--ridge-master-dilate-high-tol", type=int, default=0,
+                        help="Extra master-ridge dilation in high-tolerance "
+                             "regions. >0 enables the tolerance-aware path.")
+    parser.add_argument("--hstripe-length", type=int, default=31)
+    parser.add_argument("--hstripe-thickness", type=int, default=3)
 
     parser.add_argument("--max-input-width", type=int, default=1600,
                         help="Downsample huge inputs to this width before "
@@ -296,7 +314,9 @@ def main() -> None:
         erode_px=args.roi_erode_px,
     )
     builder = ReferenceBuilder(
-        blur_ksize=args.ref_blur, align=True, dispersion=args.dispersion,
+        blur_ksize=args.ref_blur, align=True,
+        align_method=args.ref_align_method,
+        dispersion=args.dispersion,
         photometric=photometric, roi=roi_cfg,
     )
     t0 = time.time()

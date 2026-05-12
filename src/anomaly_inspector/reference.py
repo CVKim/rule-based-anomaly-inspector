@@ -9,7 +9,7 @@ from typing import Iterable
 import cv2
 import numpy as np
 
-from .alignment import align_translation
+from .alignment import align_ecc, align_translation
 from .photometric import PhotometricCorrector
 from .roi import RoiConfig, auto_part_roi
 from .utils import get_logger, load_gray, stack_images
@@ -47,6 +47,7 @@ class ReferenceBuilder:
     def __init__(self,
                  blur_ksize: int = 5,
                  align: bool = True,
+                 align_method: str = "phase",
                  dispersion: str = "std",
                  photometric: PhotometricCorrector | None = None,
                  roi: RoiConfig | None = None):
@@ -54,8 +55,11 @@ class ReferenceBuilder:
             raise ValueError("blur_ksize must be a positive odd integer")
         if dispersion not in {"std", "mad"}:
             raise ValueError("dispersion must be 'std' or 'mad'")
+        if align_method not in {"phase", "phase+ecc"}:
+            raise ValueError("align_method must be 'phase' | 'phase+ecc'")
         self.blur_ksize = blur_ksize
         self.align = align
+        self.align_method = align_method
         self.dispersion = dispersion
         self.photometric = photometric or PhotometricCorrector(method="none")
         self.roi = roi or RoiConfig(method="none")
@@ -83,9 +87,19 @@ class ReferenceBuilder:
             anchor = prepped[0]
             aligned = [anchor]
             for i, img in enumerate(prepped[1:], start=1):
-                res = align_translation(anchor, img)
-                aligned.append(res.aligned)
-                self.log.debug("sample %d shift=(%.3f, %.3f)", i, *res.shift)
+                phase = align_translation(anchor, img)
+                if self.align_method == "phase":
+                    aligned.append(phase.aligned)
+                    self.log.debug("sample %d shift=(%.3f, %.3f)",
+                                   i, *phase.shift)
+                else:   # "phase+ecc" — robust against cross-session drift
+                    init = np.float32([[1, 0, -phase.shift[0]],
+                                       [0, 1, -phase.shift[1]]])
+                    ecc = align_ecc(anchor, img, motion="euclidean",
+                                    init=init)
+                    aligned.append(ecc.aligned)
+                    self.log.debug("sample %d phase=(%.3f,%.3f) ecc=(%.3f,%.3f)",
+                                   i, *phase.shift, *ecc.shift)
             prepped = aligned
 
         stack = stack_images(prepped).astype(np.float32)

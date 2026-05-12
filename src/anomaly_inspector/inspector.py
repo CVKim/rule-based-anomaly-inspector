@@ -162,7 +162,8 @@ class DynamicToleranceInspector:
         aligned, shift, method, rotation_deg, scale = self._align(prepared)
 
         signed, diff = compute_residual(self.ref.master, aligned.astype(np.float32),
-                                        self.residual_config)
+                                        self.residual_config,
+                                        tolerance=self.ref.tolerance)
 
         # Symmetric threshold (used for the headline ``threshold_map`` field)
         # plus split bright/dark thresholds applied during binarization.

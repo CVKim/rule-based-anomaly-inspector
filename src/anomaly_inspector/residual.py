@@ -31,9 +31,10 @@ import numpy as np
 from .gpu import GpuContext
 
 
-Mode = Literal["absdiff", "multiscale", "ncc", "gradient", "ridge", "fused"]
+Mode = Literal["absdiff", "multiscale", "ncc", "gradient", "ridge",
+                "hstripe", "fused"]
 _VALID_MODES: tuple[Mode, ...] = ("absdiff", "multiscale", "ncc", "gradient",
-                                  "ridge", "fused")
+                                  "ridge", "hstripe", "fused")
 
 # What an ``absdiff`` residual of "obvious defect" looks like in 8-bit units —
 # used as the reference scale when normalising NCC / gradient outputs into
@@ -62,6 +63,12 @@ class ResidualConfig:
     # sensitivity while gaining edge-defect sensitivity.
     gradient_blend: float = 0.0
 
+    # hstripe (horizontal black-top-hat; targets thin horizontal dark
+    # gaps between bright metal layers — the FOOSUNG crack signature)
+    hstripe_length: int = 31     # length of horizontal structuring element (px)
+    hstripe_thickness: int = 3   # thickness (must be odd)
+    hstripe_master_dilate: int = 3   # cancels master-side stripes (gaps in the part)
+
     # ridge (Frangi-style multi-scale Hessian tubeness)
     ridge_scales: tuple[float, ...] = (1.0, 2.0, 4.0)
     ridge_polarity: Literal["dark", "bright", "both"] = "dark"
@@ -72,6 +79,13 @@ class ResidualConfig:
     # (sub-pixel alignment slop, micro-warps) still cancel cleanly. Set 0 to
     # disable for clean synthetic tests.
     ridge_master_dilate: int = 3
+    # When > 0, the master-ridge dilation is increased for high-tolerance
+    # pixels by this many extra pixels at the top of the tolerance map.
+    # The intuition: pixels that always vary (slot edges, illumination
+    # boundaries) need a wider cancellation radius than stable interior
+    # pixels. Pass the per-pixel tolerance map via the inspector; with no
+    # tolerance available, the boost is silently skipped.
+    ridge_master_dilate_high_tol: int = 0
 
     # fused: per-pixel combination of normalised residuals across these modes.
     # Defaults to "the three discriminative modes" so a single
@@ -79,12 +93,17 @@ class ResidualConfig:
     fused_modes: tuple[Mode, ...] = ("absdiff", "ncc", "ridge")
     fused_weights: tuple[float, ...] = ()    # empty = uniform
     # Combination rule:
-    #   "mean"  — weighted average (default; rewards SOME agreement)
-    #   "max"   — weighted max (catches anything any mode flagged)
-    #   "agree" — geometric mean (multiplicative; only fires where ALL
-    #             constituent modes have non-trivial response, killing
-    #             mode-specific FPs while preserving cross-mode TPs)
-    fused_op: Literal["mean", "max", "agree"] = "mean"
+    #   "mean"      — weighted average (rewards SOME agreement)
+    #   "max"       — weighted max (catches anything any mode flagged)
+    #   "agree"     — geometric mean (multiplicative; soft AND)
+    #   "intersect" — per-mode threshold then AND on the masks (hard AND).
+    #                 Each constituent residual is normalised to [0,1] and
+    #                 thresholded at ``intersect_quantile`` (per-pixel
+    #                 percentile of in-frame residual); only pixels above
+    #                 every constituent's threshold survive. Strongest
+    #                 FP-suppressor; default for crack-style defects.
+    fused_op: Literal["mean", "max", "agree", "intersect"] = "mean"
+    intersect_quantile: float = 0.99   # per-mode top-N% threshold for "intersect"
 
     # combine multiple residual modes by max — set to a tuple of modes to
     # union them all. Empty = use ``mode`` only. Distinct from ``fused_modes``:
@@ -125,13 +144,23 @@ class ResidualConfig:
             raise ValueError("ridge_beta and ridge_c must be > 0")
         if self.ridge_master_dilate < 0:
             raise ValueError("ridge_master_dilate must be >= 0")
+        if self.ridge_master_dilate_high_tol < 0:
+            raise ValueError("ridge_master_dilate_high_tol must be >= 0")
+        if self.hstripe_length < 5 or self.hstripe_length % 2 == 0:
+            raise ValueError("hstripe_length must be an odd integer >= 5")
+        if self.hstripe_thickness < 1 or self.hstripe_thickness % 2 == 0:
+            raise ValueError("hstripe_thickness must be an odd integer >= 1")
+        if self.hstripe_master_dilate < 0:
+            raise ValueError("hstripe_master_dilate must be >= 0")
         for m in self.fused_modes:
             if m not in _VALID_MODES or m == "fused":
                 raise ValueError(f"unknown / illegal fused mode '{m}'")
         if self.fused_weights and len(self.fused_weights) != len(self.fused_modes):
             raise ValueError("fused_weights length must match fused_modes")
-        if self.fused_op not in {"mean", "max", "agree"}:
-            raise ValueError("fused_op must be 'mean' | 'max' | 'agree'")
+        if self.fused_op not in {"mean", "max", "agree", "intersect"}:
+            raise ValueError("fused_op must be 'mean' | 'max' | 'agree' | 'intersect'")
+        if not (0.5 <= self.intersect_quantile < 1.0):
+            raise ValueError("intersect_quantile must be in [0.5, 1.0)")
         for m in self.extra_modes:
             if m not in _VALID_MODES:
                 raise ValueError(f"unknown extra mode '{m}'")
@@ -150,9 +179,14 @@ class ResidualConfig:
             "ridge_beta": float(self.ridge_beta),
             "ridge_c": float(self.ridge_c),
             "ridge_master_dilate": int(self.ridge_master_dilate),
+            "ridge_master_dilate_high_tol": int(self.ridge_master_dilate_high_tol),
+            "hstripe_length": int(self.hstripe_length),
+            "hstripe_thickness": int(self.hstripe_thickness),
+            "hstripe_master_dilate": int(self.hstripe_master_dilate),
             "fused_modes": list(self.fused_modes),
             "fused_weights": list(self.fused_weights),
             "fused_op": self.fused_op,
+            "intersect_quantile": float(self.intersect_quantile),
             "extra_modes": list(self.extra_modes),
             "use_opencl": bool(self.use_opencl),
             "use_gpu_ridge": bool(self.use_gpu_ridge),
@@ -179,9 +213,14 @@ class ResidualConfig:
             ridge_beta=float(meta.get("ridge_beta", 0.5)),
             ridge_c=float(meta.get("ridge_c", 15.0)),
             ridge_master_dilate=int(meta.get("ridge_master_dilate", 3)),
+            ridge_master_dilate_high_tol=int(meta.get("ridge_master_dilate_high_tol", 0)),
+            hstripe_length=int(meta.get("hstripe_length", 31)),
+            hstripe_thickness=int(meta.get("hstripe_thickness", 3)),
+            hstripe_master_dilate=int(meta.get("hstripe_master_dilate", 3)),
             fused_modes=tuple(fused_modes),
             fused_weights=tuple(float(w) for w in fused_weights),
             fused_op=meta.get("fused_op", "mean"),
+            intersect_quantile=float(meta.get("intersect_quantile", 0.99)),
             extra_modes=tuple(extras),
             use_opencl=bool(meta.get("use_opencl", False)),
             use_gpu_ridge=bool(meta.get("use_gpu_ridge", False)),
@@ -192,7 +231,9 @@ _FUSABLE: tuple[Mode, ...] = ("absdiff", "multiscale", "ncc", "gradient", "ridge
 
 
 def compute_residual(master: np.ndarray, target: np.ndarray,
-                     config: ResidualConfig) -> tuple[np.ndarray, np.ndarray]:
+                     config: ResidualConfig,
+                     tolerance: np.ndarray | None = None,
+                     ) -> tuple[np.ndarray, np.ndarray]:
     """Return ``(signed_residual, abs_residual)`` for the configured mode.
 
     Both maps are float32 in the same gray-level space as ``master`` so the
@@ -206,10 +247,12 @@ def compute_residual(master: np.ndarray, target: np.ndarray,
     m = master.astype(np.float32)
     t = target.astype(np.float32)
 
-    primary_signed, primary_abs = _residual_one(m, t, config.mode, config)
+    primary_signed, primary_abs = _residual_one(m, t, config.mode, config,
+                                                tolerance=tolerance)
 
     if config.gradient_blend > 0 and config.mode != "gradient":
-        _g_signed, g_abs = _residual_one(m, t, "gradient", config)
+        _g_signed, g_abs = _residual_one(m, t, "gradient", config,
+                                          tolerance=tolerance)
         primary_abs = primary_abs + config.gradient_blend * g_abs
         # Signed residual loses meaning when blended with an unsigned source;
         # keep the original sign mask for any downstream polarity check.
@@ -218,7 +261,8 @@ def compute_residual(master: np.ndarray, target: np.ndarray,
         for extra_mode in config.extra_modes:
             if extra_mode == config.mode:
                 continue
-            _signed, abs_extra = _residual_one(m, t, extra_mode, config)
+            _signed, abs_extra = _residual_one(m, t, extra_mode, config,
+                                                tolerance=tolerance)
             primary_abs = np.maximum(primary_abs, abs_extra)
 
     return primary_signed, primary_abs
@@ -228,7 +272,9 @@ def compute_residual(master: np.ndarray, target: np.ndarray,
 
 
 def _residual_one(master: np.ndarray, target: np.ndarray,
-                  mode: Mode, config: ResidualConfig) -> tuple[np.ndarray, np.ndarray]:
+                  mode: Mode, config: ResidualConfig,
+                  tolerance: np.ndarray | None = None,
+                  ) -> tuple[np.ndarray, np.ndarray]:
     if mode == "absdiff":
         signed = target - master
         return signed, np.abs(signed)
@@ -246,11 +292,15 @@ def _residual_one(master: np.ndarray, target: np.ndarray,
         return grad_abs.copy(), grad_abs
 
     if mode == "ridge":
-        ridge_abs = _ridge_residual(master, target, config)
+        ridge_abs = _ridge_residual(master, target, config, tolerance=tolerance)
         return ridge_abs.copy(), ridge_abs
 
+    if mode == "hstripe":
+        hs = _hstripe_residual(master, target, config)
+        return hs.copy(), hs
+
     if mode == "fused":
-        fused = _fused_residual(master, target, config)
+        fused = _fused_residual(master, target, config, tolerance=tolerance)
         return fused.copy(), fused
 
     raise AssertionError(f"unhandled mode '{mode}'")  # pragma: no cover
@@ -371,6 +421,47 @@ def _gradient_residual(master: np.ndarray, target: np.ndarray,
     return diff.astype(np.float32)
 
 
+# ---------- horizontal-stripe (black top-hat) ------------------------------
+
+
+def _hstripe_residual(master: np.ndarray, target: np.ndarray,
+                      config: ResidualConfig) -> np.ndarray:
+    """Horizontal black-top-hat ``residual = (close(target, hkernel) - target)``
+    minus the corresponding master response with neighbourhood-max
+    cancellation.
+
+    The "horizontal black-top-hat" picks out **thin dark horizontal
+    grooves** sitting on a brighter background — the FOOSUNG side-view
+    crack signature exactly. Master subtraction (with master-side
+    dilation) cancels legitimate machined gaps, leaving only NEW dark
+    horizontal stripes in the target.
+    """
+    src_t = _to_uint8(target)
+    src_m = _to_uint8(master)
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (config.hstripe_length, config.hstripe_thickness)
+    )
+    # MORPH_BLACKHAT = closing - input -> highlights dark structures
+    # smaller than the kernel.
+    Bm = cv2.morphologyEx(src_m, cv2.MORPH_BLACKHAT, kernel).astype(np.float32)
+    Bt = cv2.morphologyEx(src_t, cv2.MORPH_BLACKHAT, kernel).astype(np.float32)
+
+    if config.hstripe_master_dilate > 0:
+        d = config.hstripe_master_dilate
+        dk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                       (2 * d + 1, 2 * d + 1))
+        Bm = cv2.dilate(Bm, dk)
+
+    diff = np.maximum(Bt - Bm, 0.0)
+    return diff.astype(np.float32)
+
+
+def _to_uint8(img: np.ndarray) -> np.ndarray:
+    if img.dtype == np.uint8:
+        return img
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
 # ---------- ridge (Frangi-style multi-scale Hessian) -----------------------
 
 
@@ -437,7 +528,8 @@ def _multi_scale_ridge_cpu(img: np.ndarray, config: ResidualConfig,
 
 
 def _ridge_residual(master: np.ndarray, target: np.ndarray,
-                    config: ResidualConfig) -> np.ndarray:
+                    config: ResidualConfig,
+                    tolerance: np.ndarray | None = None) -> np.ndarray:
     """Multi-scale ridge response **difference** between target and master.
 
     The Frangi response by itself flags every legitimate ridge in the master
@@ -474,7 +566,21 @@ def _ridge_residual(master: np.ndarray, target: np.ndarray,
         d = config.ridge_master_dilate
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                            (2 * d + 1, 2 * d + 1))
-        Vm = cv2.dilate(Vm, kernel)
+        Vm_base = cv2.dilate(Vm, kernel)
+        Vm = Vm_base
+        # Tolerance-aware: at high-tolerance pixels (the per-pixel std is
+        # large because the master varies a lot — typically machined
+        # edges), use a wider dilation so any drift cancels. Elsewhere
+        # the tighter dilation preserves real defects.
+        if config.ridge_master_dilate_high_tol > 0 and tolerance is not None:
+            d2 = d + config.ridge_master_dilate_high_tol
+            kernel2 = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * d2 + 1, 2 * d2 + 1)
+            )
+            Vm_extra = cv2.dilate(Vm, kernel2)
+            high_tol_thresh = float(np.percentile(tolerance, 90.0))
+            high_tol_mask = tolerance > high_tol_thresh
+            Vm = np.where(high_tol_mask, Vm_extra, Vm_base)
 
     diff = np.maximum(Vt - Vm, 0.0)   # only "new" ridges
 
@@ -488,7 +594,8 @@ def _ridge_residual(master: np.ndarray, target: np.ndarray,
 
 
 def _fused_residual(master: np.ndarray, target: np.ndarray,
-                    config: ResidualConfig) -> np.ndarray:
+                    config: ResidualConfig,
+                    tolerance: np.ndarray | None = None) -> np.ndarray:
     """Per-pixel combination of normalised residuals across multiple modes.
 
     Each constituent residual is min/max-normalised on a robust percentile
@@ -513,7 +620,8 @@ def _fused_residual(master: np.ndarray, target: np.ndarray,
     for m in modes:
         if m == "fused":
             raise ValueError("fused mode cannot reference itself")
-        _signed, abs_r = _residual_one(master, target, m, config)
+        _signed, abs_r = _residual_one(master, target, m, config,
+                                        tolerance=tolerance)
         normed_per_mode.append(_robust_normalise(abs_r))
 
     if config.fused_op == "mean":
@@ -525,7 +633,7 @@ def _fused_residual(master: np.ndarray, target: np.ndarray,
         result = normed_per_mode[0] * weights[0]
         for w, n in zip(weights[1:], normed_per_mode[1:]):
             result = np.maximum(result, w * n)
-    else:   # "agree" — weighted geometric mean
+    elif config.fused_op == "agree":   # weighted geometric mean
         # Add a small floor so the geometric mean isn't dominated by a
         # single zero and so log(.) is finite.
         eps = 1e-3
@@ -533,6 +641,26 @@ def _fused_residual(master: np.ndarray, target: np.ndarray,
         for w, n in zip(weights, normed_per_mode):
             log_accum += w * np.log(n + eps)
         result = np.exp(log_accum) - eps
+        result = np.clip(result, 0.0, 1.0)
+    else:   # "intersect" — per-mode percentile threshold then mask AND
+        # For each mode, threshold at its own ``intersect_quantile``-th
+        # percentile (computed over the whole frame). Pixels surviving
+        # ALL modes' thresholds get the geometric-mean of their (above-
+        # threshold) values; everything else is zero. This is the strict
+        # version of "agree": a single quiet mode kills the whole pixel.
+        q = float(np.clip(config.intersect_quantile, 0.5, 0.999))
+        mask: np.ndarray | None = None
+        for n in normed_per_mode:
+            thr = float(np.quantile(n, q))
+            m = n > thr
+            mask = m if mask is None else (mask & m)
+        # Combine surviving values via geometric mean for ranking.
+        eps = 1e-3
+        log_accum = np.zeros_like(master, dtype=np.float32)
+        for w, n in zip(weights, normed_per_mode):
+            log_accum += w * np.log(n + eps)
+        score = np.exp(log_accum) - eps
+        result = np.where(mask, score, 0.0)
         result = np.clip(result, 0.0, 1.0)
 
     return (result * _GRAY_REFERENCE_SCALE).astype(np.float32)

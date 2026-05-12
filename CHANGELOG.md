@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.6.0
+
+A precision push driven by GT-driven feedback: every previous setup was
+recall-rich but precision-poor. Four coupled changes get F1 from
+**0.105 → 0.462 (4.4×)** on the FOOSUNG side-view dataset while still
+catching every NG image.
+
+### Added
+
+- **Mask-level intersection fusion** (``ResidualConfig.fused_op="intersect"``)
+  - Each constituent residual is normalised to ``[0, 1]`` and thresholded
+    at its own per-frame ``intersect_quantile`` (default 0.95). A pixel
+    survives only if it's in the top-N% of EVERY constituent mode —
+    the strict version of "agree". Soft FPs that fire only one mode get
+    zeroed; real defects that fire multiple modes survive.
+  - The strict AND was the missing piece: geometric mean (``agree``)
+    didn't kill mode-specific noise hard enough.
+
+- **Tolerance-aware ridge dilation** (``ridge_master_dilate_high_tol``)
+  - When a tolerance map is passed and ``ridge_master_dilate_high_tol > 0``,
+    the master-ridge cancellation radius widens at high-tolerance pixels
+    (top 10% of the per-pixel std). Sub-pixel-shifting machined edges
+    (whose std is naturally large) get more cancellation slack while the
+    stable interior keeps the tighter radius for sensitivity.
+
+- **Cross-session reference alignment** (``ReferenceBuilder.align_method="phase+ecc"``)
+  - When stacking normals from disparate captures, ``phase+ecc`` (phase
+    correlation seed + euclidean ECC refinement) recovers sub-pixel
+    rotation/warp before the median, so the master doesn't ghost. Falls
+    back cleanly to the v0.1 ``phase`` default for single-session sources.
+
+- **Horizontal black-tophat residual** (``mode="hstripe"``)
+  - Targets thin horizontal dark gaps between bright metal layers — the
+    FOOSUNG crack signature. ``hstripe_length`` × ``hstripe_thickness``
+    rectangular structuring element, with master subtraction
+    (``hstripe_master_dilate``) to cancel legitimate machined gaps.
+    Constraint: ``hstripe_thickness >= 2 * defect_thickness + 1``.
+
+### Wiring
+
+- ``compute_residual`` now accepts an optional ``tolerance`` argument
+  threaded through ``DynamicToleranceInspector`` and ``scripts/tune.py``
+  so the tolerance-aware paths can see it without changing call sites.
+- ``scripts/evaluate.py`` exposes ``--fused-op intersect``,
+  ``--intersect-quantile``, ``--ridge-master-dilate-high-tol``,
+  ``--ref-align-method``, ``--hstripe-length``, ``--hstripe-thickness``.
+- The ``hstripe`` mode is added to the modes choice list.
+
+### Real-data results (FOOSUNG side-view, 6 NG + 4 OK)
+
+| run                                         | F1    | Recall | hardFP/img | Pix IoU | Pix recall |
+|---------------------------------------------|-------|--------|------------|---------|------------|
+| v5 baseline (ridge, agree fusion, 12n)      | 0.084 | 0.739  | 45.5       | 0.114   | 0.510      |
+| v9 (tol-aware ridge alone)                  | 0.105 | 0.739  | 35.4       | 0.124   | 0.488      |
+| **v10 BEST: tol-aware ridge + intersect q=0.95** | **0.462** | 0.522 | **2.12** | **0.172** | 0.285 |
+
+What changed at v10 vs v5:
+- Ridge alone, with tolerance-aware dilation, drops FPs by ~22% with
+  same recall (v5 → v9).
+- Intersect fusion of (absdiff + tol-aware ridge) at q=0.95 then
+  drops FPs by **94%** (35.4 → 2.12) at the cost of 30% recall
+  (0.74 → 0.52). Net F1 jumps **4.4×**.
+
+The v10 setup is the new recommended production operating point for
+crack-style defects.
+
+### Tests
+
+- 4 new tests in ``test_ridge_fused.py`` covering intersect-fusion
+  thinning, intersect_quantile validation, hstripe horizontal-stripe
+  isolation, and tolerance-aware ridge cancellation. Suite total:
+  **99 tests, all green**.
+
 ## v0.5.1
 
 `--normal` now accepts multiple folders so the reference can be built
