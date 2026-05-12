@@ -179,7 +179,10 @@ def render_comparison_panel(image: np.ndarray,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--normal", required=True, type=Path)
+    parser.add_argument("--normal", required=True, type=Path, nargs="+",
+                        help="One or more folders of known-good images. "
+                             "When multiple are passed, all images are "
+                             "concatenated into a single reference build.")
     parser.add_argument("--test", required=True, type=Path)
     parser.add_argument("--gt", required=True, type=Path,
                         help="Folder of labelme JSONs.")
@@ -257,8 +260,13 @@ def main() -> None:
         raise SystemExit(f"no test images matched any GT file in {args.gt}")
     log.info("matched %d test images to GT", len(test_paths))
 
-    normal_paths = list_images(args.normal)
-    log.info("normals: %d", len(normal_paths))
+    normal_paths: list[Path] = []
+    for nd in args.normal:
+        nd_paths = list_images(nd)
+        log.info("  normal source %s: %d images", nd, len(nd_paths))
+        normal_paths.extend(nd_paths)
+    log.info("normals: %d total across %d source(s)",
+             len(normal_paths), len(args.normal))
 
     # ------------------------------------------------------------------
     # Build reference (one shared, all modes)
@@ -412,9 +420,15 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Write report.json + summary.csv + complementarity matrix
     # ------------------------------------------------------------------
+    def _arg_to_jsonable(v):
+        if isinstance(v, Path):
+            return str(v)
+        if isinstance(v, (list, tuple)):
+            return [_arg_to_jsonable(x) for x in v]
+        return v
+
     full_report = {
-        "args": {k: (str(v) if isinstance(v, Path) else v)
-                  for k, v in vars(args).items()},
+        "args": {k: _arg_to_jsonable(v) for k, v in vars(args).items()},
         "n_test_images": len(test_paths),
         "has_polygons": has_polygons,
         "modes": {m: rep.to_dict() for m, rep in reports.items()},

@@ -119,7 +119,8 @@ def quick_threshold_blob(signed: np.ndarray, diff: np.ndarray,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--normal", required=True, type=Path)
+    parser.add_argument("--normal", required=True, type=Path, nargs="+",
+                        help="One or more folders of known-good images.")
     parser.add_argument("--test", required=True, type=Path)
     parser.add_argument("--gt", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -192,7 +193,11 @@ def main() -> None:
     # Build shared reference
     # ------------------------------------------------------------------
     log.info("loading normals...")
-    normal_paths = list_images(args.normal)
+    normal_paths: list[Path] = []
+    for nd in args.normal:
+        nd_paths = list_images(nd)
+        log.info("  normal source %s: %d images", nd, len(nd_paths))
+        normal_paths.extend(nd_paths)
     normals: list[np.ndarray] = []
     target_shape: tuple[int, int] | None = None
     for p in normal_paths:

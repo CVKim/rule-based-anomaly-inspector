@@ -163,6 +163,16 @@ python scripts/run_inference_panels.py \
     --max-input-width 1600        # downsample huge inputs (set 0 = native res)
 ```
 
+`--normal` accepts **multiple folders** so you can grow the reference
+sample pool from disparate captures (master + repeats + borderline-OK
+samples) without flattening them all into one directory:
+
+```bash
+python scripts/run_inference_panels.py \
+    --normal "good_run_a" "good_run_b" "borderline_acceptable" \
+    --test   ... --output ... --modes ridge fused --gpu-ridge
+```
+
 Produces `outputs/run01/<mode>/<stem>_panel.png` six-cell visualisations
 (image | heatmap | mask pred | pred conf fg | pred conf bg | overlay) and
 a per-mode `summary.csv` with detection counts, recovered alignment, and
