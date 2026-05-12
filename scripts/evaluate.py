@@ -45,7 +45,7 @@ from anomaly_inspector import (  # noqa: E402
 )
 from anomaly_inspector.evaluation import (  # noqa: E402
     ModeReport, boxes_from_defects, evaluate_image, load_gt_folder,
-    mode_complementarity,
+    mode_complementarity, pixel_metrics,
 )
 from anomaly_inspector.utils import (  # noqa: E402
     SUPPORTED_EXTS, ensure_dir, get_logger, imread_unicode, imwrite_unicode,
@@ -71,6 +71,9 @@ def make_inspector(ref, mode: str, args) -> DynamicToleranceInspector:
         ncc_window=args.ncc_window,
         gradient_op=args.gradient_op,         # type: ignore[arg-type]
         gradient_blend=args.gradient_blend,
+        use_gpu_ridge=args.gpu_ridge,
+        fused_op=args.fused_op,               # type: ignore[arg-type]
+        fused_modes=tuple(args.fused_modes),  # type: ignore[arg-type]
     )
     return DynamicToleranceInspector(
         ref,
@@ -92,7 +95,9 @@ def render_comparison_panel(image: np.ndarray,
                             pred_scale: float,
                             roi_mask: np.ndarray | None,
                             max_width: int = 1800,
-                            title: str = "") -> np.ndarray:
+                            title: str = "",
+                            gt_polygons_full: list[list[tuple[float, float]]]
+                                              | None = None) -> np.ndarray:
     """One-cell panel: original image + GT (green), TP (cyan), hard FP (red),
     soft FP (orange), FN marker (yellow X). All boxes drawn in pred-space
     coordinates (pred_scale=1) or full-res (then scaled down for display)."""
@@ -119,9 +124,22 @@ def render_comparison_panel(image: np.ndarray,
             cv2.putText(vis, label, (x1, max(0, y1 - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 
-    # GT (green, dashed look via thin border)
-    for g in gt_boxes_full:
-        _draw(g, (0, 255, 0), 2, "GT")
+    # GT — draw polygon outline when available, otherwise bbox.
+    if gt_polygons_full:
+        for i, poly in enumerate(gt_polygons_full):
+            if poly:
+                pts = np.array(poly, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(vis, [pts], isClosed=True,
+                              color=(0, 255, 0), thickness=2)
+                cx, cy = pts[:, 0, 0].mean(), pts[:, 0, 1].mean()
+                cv2.putText(vis, "GT", (int(cx), int(cy)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+                            cv2.LINE_AA)
+            else:
+                _draw(gt_boxes_full[i], (0, 255, 0), 2, "GT")
+    else:
+        for g in gt_boxes_full:
+            _draw(g, (0, 255, 0), 2, "GT")
 
     for pi, p in enumerate(pred_boxes_pred):
         p_full = (p[0] * pred_scale, p[1] * pred_scale,
@@ -198,6 +216,14 @@ def main() -> None:
     parser.add_argument("--gradient-op", default="scharr",
                         choices=["sobel", "scharr"])
     parser.add_argument("--gradient-blend", type=float, default=0.0)
+    parser.add_argument("--gpu-ridge", action="store_true",
+                        help="Run the ridge filter on torch CUDA when "
+                             "available (~25-50x faster).")
+    parser.add_argument("--fused-op", default="mean",
+                        choices=["mean", "max", "agree"],
+                        help="How to combine constituent residuals in fused mode.")
+    parser.add_argument("--fused-modes", nargs="+",
+                        default=["absdiff", "ncc", "ridge"])
 
     parser.add_argument("--max-input-width", type=int, default=1600,
                         help="Downsample huge inputs to this width before "
@@ -208,6 +234,11 @@ def main() -> None:
                              "are bucketed as 'soft' (likely unlabelled).")
     parser.add_argument("--no-panels", action="store_true",
                         help="Skip the per-image comparison panels (faster).")
+    parser.add_argument("--polygon-iou", action="store_true",
+                        help="When GT carries polygons, use true polygon IoU "
+                             "for matching (slower but more accurate). "
+                             "Pixel metrics are always computed when polygons "
+                             "are present, regardless of this flag.")
 
     args = parser.parse_args()
     log = get_logger()
@@ -278,6 +309,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     out_root = ensure_dir(args.output)
     reports: dict[str, ModeReport] = {}
+    # Per-mode aggregate pixel metrics (computed across all NG images).
+    pixel_agg: dict[str, dict[str, float]] = {}
+    has_polygons = any(any(b.is_polygon for b in g.boxes) for g in gt.values())
+    if has_polygons:
+        log.info("polygon GT detected — pixel-level metrics will be computed")
 
     # Pre-load test images at inference scale (one shot, reused across modes)
     targets: dict[str, np.ndarray] = {}
@@ -294,6 +330,10 @@ def main() -> None:
         rep = ModeReport(mode=mode, iou_threshold=args.iou_threshold)
         mode_dir = ensure_dir(out_root / mode)
 
+        # Cache per-image predictions in full-res so the pixel-metric pass
+        # below doesn't have to re-inspect.
+        per_image_pred_full: dict[str, list[tuple[float, float, float, float]]] = {}
+
         for p in test_paths:
             img = targets[p.name]
             t1 = time.time()
@@ -301,6 +341,11 @@ def main() -> None:
             ms = (time.time() - t1) * 1000.0
 
             pred_boxes = boxes_from_defects(result.defects)
+            per_image_pred_full[p.name] = [
+                (b[0] * pred_scale, b[1] * pred_scale,
+                 b[2] * pred_scale, b[3] * pred_scale)
+                for b in pred_boxes
+            ]
             ev = evaluate_image(
                 pred_boxes=pred_boxes,
                 gt=gt[p.name],
@@ -308,6 +353,7 @@ def main() -> None:
                 soft_fp_max_centre_distance=args.soft_fp_distance_px,
                 roi_mask=ref.roi_mask,
                 pred_scale=pred_scale,
+                use_polygon_iou=args.polygon_iou and has_polygons,
             )
             rep.per_image.append(ev)
             log.info("  %-12s  GT=%d  TP=%d  FN=%d  hard_FP=%d  soft_FP=%d  %.0fms",
@@ -315,6 +361,8 @@ def main() -> None:
 
             if not args.no_panels:
                 gt_full = [g.bbox for g in gt[p.name].boxes]
+                gt_polys = [list(g.polygon) if g.is_polygon else []
+                            for g in gt[p.name].boxes]
                 title = (f"{p.name}  |  mode={mode}  |  "
                          f"TP={ev.tp}  FN={ev.fn}  hardFP={ev.hard_fp}  softFP={ev.soft_fp}")
                 panel = render_comparison_panel(
@@ -322,6 +370,7 @@ def main() -> None:
                     pred_boxes_pred=pred_boxes, ev=ev,
                     pred_scale=pred_scale,
                     roi_mask=ref.roi_mask, title=title,
+                    gt_polygons_full=gt_polys,
                 )
                 imwrite_unicode(mode_dir / f"{p.stem}_eval.png", panel)
 
@@ -333,6 +382,33 @@ def main() -> None:
         log.info("  -> image classification: TP=%d FP=%d TN=%d FN=%d",
                  ic["TP"], ic["FP"], ic["TN"], ic["FN"])
 
+        # Pixel metrics across all NG images (if polygon GT present).
+        if has_polygons:
+            pix_inter = pix_gt = pix_pred = 0
+            for p in test_paths:
+                if not gt[p.name].is_ng:
+                    continue
+                pm = pixel_metrics(per_image_pred_full[p.name], gt[p.name])
+                pix_inter += pm.intersection
+                pix_gt += pm.gt_area
+                pix_pred += pm.pred_area
+            denom = pix_gt + pix_pred
+            pix_recall = pix_inter / pix_gt if pix_gt > 0 else float("nan")
+            pix_prec = pix_inter / pix_pred if pix_pred > 0 else float("nan")
+            pix_dice = 2.0 * pix_inter / denom if denom > 0 else float("nan")
+            pix_iou = (pix_inter / (pix_gt + pix_pred - pix_inter)
+                        if (pix_gt + pix_pred - pix_inter) > 0 else float("nan"))
+            pixel_agg[mode] = {
+                "intersection": float(pix_inter),
+                "gt_area": float(pix_gt),
+                "pred_area": float(pix_pred),
+                "iou": pix_iou, "dice": pix_dice,
+                "recall": pix_recall, "precision": pix_prec,
+            }
+            log.info("  -> pixel:  IoU=%.3f  Dice=%.3f  recall=%.3f  precision=%.3f",
+                     _nan(pix_iou), _nan(pix_dice),
+                     _nan(pix_recall), _nan(pix_prec))
+
     # ------------------------------------------------------------------
     # Write report.json + summary.csv + complementarity matrix
     # ------------------------------------------------------------------
@@ -340,7 +416,9 @@ def main() -> None:
         "args": {k: (str(v) if isinstance(v, Path) else v)
                   for k, v in vars(args).items()},
         "n_test_images": len(test_paths),
+        "has_polygons": has_polygons,
         "modes": {m: rep.to_dict() for m, rep in reports.items()},
+        "pixel_metrics": pixel_agg,
     }
     (out_root / "report.json").write_text(
         json.dumps(full_report, indent=2, ensure_ascii=False),
@@ -348,19 +426,27 @@ def main() -> None:
     )
 
     # Summary CSV (mode x headline metric)
+    pix_cols = ",pix_IoU,pix_Dice,pix_recall,pix_prec" if has_polygons else ""
     csv_lines = [
         "mode,bbox_TP,bbox_FN,bbox_hardFP,bbox_softFP,precision,recall,F1,"
-        "hardFP_per_img,img_TP,img_FP,img_TN,img_FN"
+        "hardFP_per_img,img_TP,img_FP,img_TN,img_FN" + pix_cols
     ]
     for m, rep in reports.items():
         ic = rep.image_classification
-        csv_lines.append(
+        line = (
             f"{m},{rep.total_tp},{rep.total_fn},{rep.total_hard_fp},"
             f"{rep.total_soft_fp},"
             f"{_csv(rep.precision)},{_csv(rep.recall)},{_csv(rep.f1)},"
             f"{rep.hard_fp_per_image:.2f},"
             f"{ic['TP']},{ic['FP']},{ic['TN']},{ic['FN']}"
         )
+        if has_polygons:
+            pa = pixel_agg.get(m, {})
+            line += (f",{_csv(pa.get('iou', float('nan')))},"
+                     f"{_csv(pa.get('dice', float('nan')))},"
+                     f"{_csv(pa.get('recall', float('nan')))},"
+                     f"{_csv(pa.get('precision', float('nan')))}")
+        csv_lines.append(line)
     (out_root / "summary.csv").write_text("\n".join(csv_lines), encoding="utf-8")
 
     # Mode complementarity (which mode catches what others miss)
