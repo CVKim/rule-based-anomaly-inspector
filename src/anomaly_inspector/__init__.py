@@ -9,8 +9,9 @@ from .residual import ResidualConfig, compute_residual
 from .roi import RoiConfig, auto_part_roi
 from .panel import make_panel
 from .evaluation import (
-    GtBox, GtImage, ModeReport, evaluate_image, load_gt_folder,
-    load_labelme_json, mode_complementarity,
+    GtBox, GtImage, ModeReport, PerImageEval, PixelMetrics, bbox_iou,
+    evaluate_image, load_gt_folder, load_labelme_json,
+    mode_complementarity, pixel_metrics, polygon_iou,
 )
 from .visualization import draw_defects, side_by_side
 
@@ -36,8 +37,20 @@ __all__ = [
     "RoiConfig",
     "auto_part_roi",
     "make_panel",
+    "GtBox",
+    "GtImage",
+    "ModeReport",
+    "PerImageEval",
+    "PixelMetrics",
+    "bbox_iou",
+    "evaluate_image",
+    "load_gt_folder",
+    "load_labelme_json",
+    "mode_complementarity",
+    "pixel_metrics",
+    "polygon_iou",
     "draw_defects",
     "side_by_side",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

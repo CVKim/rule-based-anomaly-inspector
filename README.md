@@ -174,10 +174,10 @@ per-defect categories.
 > features set `--max-input-width 0` (native resolution) — costs
 > ~10× more inference time but recovers 5–10× the recall.
 
-### GT-driven evaluation (v0.4)
+### GT-driven evaluation (v0.4+)
 
-If you have labelme-style rectangle ground truth (one JSON per image,
-empty `shapes` = OK), wire it through:
+If you have labelme-style ground truth (one JSON per image; `shapes` may
+be `rectangle` or `polygon`; empty `shapes` list = OK), wire it through:
 
 ```bash
 # 1) Score every mode vs GT and write comparison panels
@@ -202,6 +202,13 @@ a `pareto.png` showing recall vs hard-FP/img coloured by F1. Soft FPs
 (predictions inside the part ROI but not overlapping any GT bbox) are
 listed separately so the operator can decide whether they're unlabelled
 defects worth adding to GT.
+
+When the GT folder contains polygon shapes, the eval script additionally
+reports **pixel-level metrics** (IoU, Dice, pixel-recall, pixel-precision)
+across all NG images, and the comparison panels outline the polygon GT
+contour instead of just the axis-aligned bbox. Pass `--polygon-iou` to
+also use true polygon IoU during the bbox-level matching step (slower:
+each (GT, pred) pair rasterises an image-sized mask).
 
 ### Choosing a photometric method
 

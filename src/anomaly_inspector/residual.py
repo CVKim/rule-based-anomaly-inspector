@@ -28,6 +28,8 @@ from typing import Literal
 import cv2
 import numpy as np
 
+from .gpu import GpuContext
+
 
 Mode = Literal["absdiff", "multiscale", "ncc", "gradient", "ridge", "fused"]
 _VALID_MODES: tuple[Mode, ...] = ("absdiff", "multiscale", "ncc", "gradient",
@@ -71,17 +73,34 @@ class ResidualConfig:
     # disable for clean synthetic tests.
     ridge_master_dilate: int = 3
 
-    # fused: per-pixel mean of normalised residuals across these modes.
+    # fused: per-pixel combination of normalised residuals across these modes.
     # Defaults to "the three discriminative modes" so a single
     # ResidualConfig(mode="fused") works out of the box.
     fused_modes: tuple[Mode, ...] = ("absdiff", "ncc", "ridge")
     fused_weights: tuple[float, ...] = ()    # empty = uniform
+    # Combination rule:
+    #   "mean"  — weighted average (default; rewards SOME agreement)
+    #   "max"   — weighted max (catches anything any mode flagged)
+    #   "agree" — geometric mean (multiplicative; only fires where ALL
+    #             constituent modes have non-trivial response, killing
+    #             mode-specific FPs while preserving cross-mode TPs)
+    fused_op: Literal["mean", "max", "agree"] = "mean"
 
     # combine multiple residual modes by max — set to a tuple of modes to
     # union them all. Empty = use ``mode`` only. Distinct from ``fused_modes``:
     # extra_modes uses MAX over **abs** residuals (catches anything any mode
     # flagged); fused averages NORMALISED residuals (rewards mode agreement).
     extra_modes: tuple[Mode, ...] = field(default_factory=tuple)
+
+    # OpenCL acceleration: when True and cv2 has OpenCL support, the
+    # ridge / multiscale / NCC / gradient inner loops dispatch their
+    # filter ops to cv2.UMat. Cheap to enable; benchmark first.
+    use_opencl: bool = False
+    # Torch CUDA acceleration for the ridge filter specifically (the
+    # slowest residual mode). When True and torch+CUDA is importable,
+    # ``_ridge_response`` runs the multi-scale Frangi pipeline entirely
+    # on the GPU. ~25-50× faster than CPU on a 12 MP image.
+    use_gpu_ridge: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in _VALID_MODES:
@@ -111,6 +130,8 @@ class ResidualConfig:
                 raise ValueError(f"unknown / illegal fused mode '{m}'")
         if self.fused_weights and len(self.fused_weights) != len(self.fused_modes):
             raise ValueError("fused_weights length must match fused_modes")
+        if self.fused_op not in {"mean", "max", "agree"}:
+            raise ValueError("fused_op must be 'mean' | 'max' | 'agree'")
         for m in self.extra_modes:
             if m not in _VALID_MODES:
                 raise ValueError(f"unknown extra mode '{m}'")
@@ -131,7 +152,10 @@ class ResidualConfig:
             "ridge_master_dilate": int(self.ridge_master_dilate),
             "fused_modes": list(self.fused_modes),
             "fused_weights": list(self.fused_weights),
+            "fused_op": self.fused_op,
             "extra_modes": list(self.extra_modes),
+            "use_opencl": bool(self.use_opencl),
+            "use_gpu_ridge": bool(self.use_gpu_ridge),
         }
 
     @classmethod
@@ -157,7 +181,10 @@ class ResidualConfig:
             ridge_master_dilate=int(meta.get("ridge_master_dilate", 3)),
             fused_modes=tuple(fused_modes),
             fused_weights=tuple(float(w) for w in fused_weights),
+            fused_op=meta.get("fused_op", "mean"),
             extra_modes=tuple(extras),
+            use_opencl=bool(meta.get("use_opencl", False)),
+            use_gpu_ridge=bool(meta.get("use_gpu_ridge", False)),
         )
 
 
@@ -399,6 +426,16 @@ def _ridge_response(img: np.ndarray, sigma: float,
     return V.astype(np.float32)
 
 
+def _multi_scale_ridge_cpu(img: np.ndarray, config: ResidualConfig,
+                           polarity: str) -> np.ndarray:
+    """Per-pixel max over the per-scale CPU Frangi response."""
+    per_scale = [
+        _ridge_response(img, s, config.ridge_beta, config.ridge_c, polarity)
+        for s in config.ridge_scales
+    ]
+    return np.maximum.reduce(per_scale)
+
+
 def _ridge_residual(master: np.ndarray, target: np.ndarray,
                     config: ResidualConfig) -> np.ndarray:
     """Multi-scale ridge response **difference** between target and master.
@@ -409,16 +446,24 @@ def _ridge_residual(master: np.ndarray, target: np.ndarray,
     i.e. crack candidates.
     """
     polarity = config.ridge_polarity
-    # Per-scale response for both, take per-pixel max across scales
-    def _multi_scale(img: np.ndarray) -> np.ndarray:
-        per_scale = [
-            _ridge_response(img, s, config.ridge_beta, config.ridge_c, polarity)
-            for s in config.ridge_scales
-        ]
-        return np.maximum.reduce(per_scale)
 
-    Vm = _multi_scale(master)
-    Vt = _multi_scale(target)
+    if config.use_gpu_ridge:
+        from .gpu import torch_cuda_available, torch_ridge_response
+        if torch_cuda_available():
+            Vm = torch_ridge_response(master, tuple(config.ridge_scales),
+                                       config.ridge_beta, config.ridge_c,
+                                       polarity)
+            Vt = torch_ridge_response(target, tuple(config.ridge_scales),
+                                       config.ridge_beta, config.ridge_c,
+                                       polarity)
+        else:
+            # GPU requested but not available — fall back to CPU silently
+            # to keep config files portable across machines.
+            Vm = _multi_scale_ridge_cpu(master, config, polarity)
+            Vt = _multi_scale_ridge_cpu(target, config, polarity)
+    else:
+        Vm = _multi_scale_ridge_cpu(master, config, polarity)
+        Vt = _multi_scale_ridge_cpu(target, config, polarity)
 
     # Spatial-dilation cancellation: a legitimate ridge in the master that
     # drifts by a few pixels in the target (sub-pixel alignment slop, line-
@@ -444,34 +489,53 @@ def _ridge_residual(master: np.ndarray, target: np.ndarray,
 
 def _fused_residual(master: np.ndarray, target: np.ndarray,
                     config: ResidualConfig) -> np.ndarray:
-    """Per-pixel weighted mean of normalised residuals across multiple modes.
+    """Per-pixel combination of normalised residuals across multiple modes.
 
     Each constituent residual is min/max-normalised on a robust percentile
-    range (1st-99th) before averaging so a single mode with a wider numeric
-    spread doesn't dominate. The result is rescaled to the gray-level
-    range so the inspector's dynamic threshold still applies.
+    range (1st-99th) before combining. The combination rule is set by
+    ``fused_op``:
 
-    Compared to ``extra_modes`` (per-pixel max over abs residuals), fusion
-    REWARDS mode agreement instead of taking the loudest signal: a real
-    defect tends to light up multiple modes, while mode-specific noise
-    (e.g. NCC's edge-halo noise) only fires in one — so fusion implicitly
-    cuts FPs while keeping recall.
+    * ``"mean"``  weighted average — rewards SOME agreement;
+    * ``"max"``   weighted max — catches anything any mode flagged;
+    * ``"agree"`` weighted geometric mean — only fires where ALL
+      constituent modes have non-trivial response, killing mode-specific
+      FPs while preserving cross-mode TPs.
+
+    The result is rescaled to the gray-level range so the inspector's
+    dynamic threshold still applies.
     """
-    # Default to "the three most discriminative" if none specified
     modes = config.fused_modes or ("absdiff", "ncc", "ridge")
     weights = (config.fused_weights or (1.0,) * len(modes))
     weights = np.asarray(weights, dtype=np.float32)
     weights = weights / weights.sum()
 
-    accum = np.zeros_like(master, dtype=np.float32)
-    for w, m in zip(weights, modes):
+    normed_per_mode: list[np.ndarray] = []
+    for m in modes:
         if m == "fused":
             raise ValueError("fused mode cannot reference itself")
         _signed, abs_r = _residual_one(master, target, m, config)
-        normed = _robust_normalise(abs_r)
-        accum += w * normed
+        normed_per_mode.append(_robust_normalise(abs_r))
 
-    return (accum * _GRAY_REFERENCE_SCALE).astype(np.float32)
+    if config.fused_op == "mean":
+        accum = np.zeros_like(master, dtype=np.float32)
+        for w, n in zip(weights, normed_per_mode):
+            accum += w * n
+        result = accum
+    elif config.fused_op == "max":
+        result = normed_per_mode[0] * weights[0]
+        for w, n in zip(weights[1:], normed_per_mode[1:]):
+            result = np.maximum(result, w * n)
+    else:   # "agree" — weighted geometric mean
+        # Add a small floor so the geometric mean isn't dominated by a
+        # single zero and so log(.) is finite.
+        eps = 1e-3
+        log_accum = np.zeros_like(master, dtype=np.float32)
+        for w, n in zip(weights, normed_per_mode):
+            log_accum += w * np.log(n + eps)
+        result = np.exp(log_accum) - eps
+        result = np.clip(result, 0.0, 1.0)
+
+    return (result * _GRAY_REFERENCE_SCALE).astype(np.float32)
 
 
 def _robust_normalise(arr: np.ndarray,

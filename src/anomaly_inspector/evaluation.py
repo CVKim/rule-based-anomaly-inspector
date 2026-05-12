@@ -34,9 +34,16 @@ import numpy as np
 
 @dataclass(frozen=True)
 class GtBox:
-    """A single labelled defect rectangle in image-pixel coordinates."""
+    """A single labelled defect in image-pixel coordinates.
+
+    Always carries an axis-aligned ``bbox`` for cheap IoU matching. If the
+    underlying labelme shape was a polygon, the original vertex list is
+    preserved in ``polygon`` so callers that want pixel-accurate IoU /
+    dice / coverage can rasterise it on demand.
+    """
     label: str
-    bbox: tuple[float, float, float, float]   # x, y, w, h
+    bbox: tuple[float, float, float, float]   # x, y, w, h (axis-aligned)
+    polygon: tuple[tuple[float, float], ...] = ()   # empty -> rectangle source
 
     @property
     def cx(self) -> float:
@@ -45,6 +52,31 @@ class GtBox:
     @property
     def cy(self) -> float:
         return self.bbox[1] + self.bbox[3] / 2.0
+
+    @property
+    def is_polygon(self) -> bool:
+        return len(self.polygon) >= 3
+
+    def rasterise(self, height: int, width: int) -> "np.ndarray":
+        """Return a uint8 mask of this defect at (height, width).
+
+        Both polygon and rectangle paths use OpenCV draw functions
+        (``fillPoly`` / ``rectangle`` with ``thickness=-1``) so the
+        boundary-pixel convention matches the predicted-bbox rasterisation
+        in ``pixel_metrics`` — otherwise an off-by-one rim shows up at
+        every defect edge and inflates the union.
+        """
+        import cv2
+        mask = np.zeros((int(height), int(width)), dtype=np.uint8)
+        if self.is_polygon:
+            pts = np.array(self.polygon, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(mask, [pts], 255)
+        else:
+            x, y, w, h = self.bbox
+            x1, y1 = int(round(x)), int(round(y))
+            x2, y2 = int(round(x + w)), int(round(y + h))
+            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, thickness=-1)
+        return mask
 
 
 @dataclass(frozen=True)
@@ -61,25 +93,45 @@ class GtImage:
 
 
 def load_labelme_json(path: str | Path) -> GtImage:
-    """Parse a single labelme JSON. Tolerates files with no shapes (all-OK)."""
+    """Parse a single labelme JSON. Tolerates files with no shapes (all-OK).
+
+    Supports both ``rectangle`` (two corner points) and ``polygon`` (>=3
+    vertex) shape types. Polygons get an axis-aligned bbox derived from
+    their min/max extents AND the original vertex list preserved in
+    ``GtBox.polygon`` for downstream pixel-accurate IoU.
+    """
     p = Path(path)
     with open(p, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     boxes: list[GtBox] = []
     for s in data.get("shapes", []):
-        if s.get("shape_type") != "rectangle":
-            # We could support polygon -> bbox here; skip for now.
-            continue
         label = s.get("label", "") or ""
         if not label:
             continue
-        (x1, y1), (x2, y2) = s["points"]
-        x = float(min(x1, x2))
-        y = float(min(y1, y2))
-        w = float(abs(x2 - x1))
-        h = float(abs(y2 - y1))
-        boxes.append(GtBox(label=label, bbox=(x, y, w, h)))
+        kind = s.get("shape_type")
+        pts_raw = s.get("points") or []
+        if kind == "rectangle" and len(pts_raw) == 2:
+            (x1, y1), (x2, y2) = pts_raw
+            x = float(min(x1, x2))
+            y = float(min(y1, y2))
+            w = float(abs(x2 - x1))
+            h = float(abs(y2 - y1))
+            boxes.append(GtBox(label=label, bbox=(x, y, w, h)))
+        elif kind == "polygon" and len(pts_raw) >= 3:
+            arr = np.array(pts_raw, dtype=np.float32)
+            x_min = float(arr[:, 0].min())
+            y_min = float(arr[:, 1].min())
+            x_max = float(arr[:, 0].max())
+            y_max = float(arr[:, 1].max())
+            polygon = tuple((float(px), float(py)) for px, py in pts_raw)
+            boxes.append(GtBox(
+                label=label,
+                bbox=(x_min, y_min, x_max - x_min, y_max - y_min),
+                polygon=polygon,
+            ))
+        # Other shape_types (line, circle, point) are not currently used
+        # by this dataset; ignore quietly.
 
     return GtImage(
         filename=p.stem + ".bmp",            # JSON stem == BMP stem in our data
@@ -169,7 +221,8 @@ def evaluate_image(pred_boxes: list[tuple[float, float, float, float]],
                    iou_threshold: float = 0.1,
                    soft_fp_max_centre_distance: float = 100.0,
                    roi_mask: np.ndarray | None = None,
-                   pred_scale: float = 1.0) -> PerImageEval:
+                   pred_scale: float = 1.0,
+                   use_polygon_iou: bool = False) -> PerImageEval:
     """Match predictions to GT; bucket leftovers as hard / soft FPs.
 
     Parameters
@@ -209,7 +262,11 @@ def evaluate_image(pred_boxes: list[tuple[float, float, float, float]],
         ious = np.zeros((n_gt, n_pred), dtype=np.float32)
         for gi, g in enumerate(gt.boxes):
             for pi, p in enumerate(pred_full):
-                ious[gi, pi] = bbox_iou(g.bbox, p)
+                if use_polygon_iou and g.is_polygon:
+                    ious[gi, pi] = polygon_iou(g, p,
+                                                gt.image_height, gt.image_width)
+                else:
+                    ious[gi, pi] = bbox_iou(g.bbox, p)
         # Iterate in descending IoU order
         for _ in range(min(n_gt, n_pred)):
             gi, pi = np.unravel_index(int(ious.argmax()), ious.shape)
@@ -401,3 +458,97 @@ def boxes_from_defects(defects: Iterable) -> list[tuple[float, float, float, flo
         x, y, w, h = d.bbox
         out.append((float(x), float(y), float(w), float(h)))
     return out
+
+
+# ---------- pixel-level (polygon-aware) metrics ----------------------------
+
+
+@dataclass
+class PixelMetrics:
+    """Pixel-level summary across all GT defect masks in one image.
+
+    GT masks come from rasterised polygons (or rectangles when only
+    ``rectangle`` GT exists). Predictions are rasterised from their bbox.
+    Computed on the union of all defects per side, so a single image
+    yields one (intersection, GT-area, pred-area) triple.
+    """
+    image_w: int
+    image_h: int
+    intersection: int
+    gt_area: int
+    pred_area: int
+
+    @property
+    def iou(self) -> float:
+        union = self.gt_area + self.pred_area - self.intersection
+        return self.intersection / union if union > 0 else float("nan")
+
+    @property
+    def dice(self) -> float:
+        denom = self.gt_area + self.pred_area
+        return 2.0 * self.intersection / denom if denom > 0 else float("nan")
+
+    @property
+    def pixel_recall(self) -> float:
+        return self.intersection / self.gt_area if self.gt_area > 0 else float("nan")
+
+    @property
+    def pixel_precision(self) -> float:
+        return self.intersection / self.pred_area if self.pred_area > 0 else float("nan")
+
+
+def pixel_metrics(pred_boxes_full: list[tuple[float, float, float, float]],
+                  gt: GtImage) -> PixelMetrics:
+    """Rasterise GT (polygon when available, rectangle otherwise) and
+    predicted bboxes at full resolution, then compute pixel agreement.
+
+    ``pred_boxes_full`` must already be in full-resolution coordinates —
+    the caller is responsible for the ``pred_scale`` lift.
+    """
+    import cv2
+    h = max(int(gt.image_height), 1)
+    w = max(int(gt.image_width), 1)
+    gt_mask = np.zeros((h, w), dtype=np.uint8)
+    for g in gt.boxes:
+        gt_mask = np.maximum(gt_mask, g.rasterise(h, w))
+
+    pred_mask = np.zeros((h, w), dtype=np.uint8)
+    for (x, y, bw, bh) in pred_boxes_full:
+        x1 = max(0, int(round(x)))
+        y1 = max(0, int(round(y)))
+        x2 = min(w - 1, int(round(x + bw)))
+        y2 = min(h - 1, int(round(y + bh)))
+        if x2 > x1 and y2 > y1:
+            cv2.rectangle(pred_mask, (x1, y1), (x2, y2), 255, thickness=-1)
+
+    inter = int(((gt_mask > 0) & (pred_mask > 0)).sum())
+    return PixelMetrics(
+        image_w=w, image_h=h,
+        intersection=inter,
+        gt_area=int((gt_mask > 0).sum()),
+        pred_area=int((pred_mask > 0).sum()),
+    )
+
+
+def polygon_iou(gt_box: GtBox, pred_bbox: tuple[float, float, float, float],
+                image_h: int, image_w: int) -> float:
+    """True polygon IoU between one GT (polygon or rectangle) and a
+    predicted axis-aligned bbox. Uses pixel rasterisation, so it's
+    O(image area) — call sparingly (per-(GT, pred) pair).
+    """
+    import cv2
+    h = max(int(image_h), 1)
+    w = max(int(image_w), 1)
+    gt_mask = gt_box.rasterise(h, w)
+    pred_mask = np.zeros((h, w), dtype=np.uint8)
+    x, y, bw, bh = pred_bbox
+    x1 = max(0, int(round(x)))
+    y1 = max(0, int(round(y)))
+    x2 = min(w - 1, int(round(x + bw)))
+    y2 = min(h - 1, int(round(y + bh)))
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    cv2.rectangle(pred_mask, (x1, y1), (x2, y2), 255, thickness=-1)
+    inter = int(((gt_mask > 0) & (pred_mask > 0)).sum())
+    union = int(((gt_mask > 0) | (pred_mask > 0)).sum())
+    return inter / union if union > 0 else 0.0
