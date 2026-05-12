@@ -41,7 +41,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from anomaly_inspector import (  # noqa: E402
     DynamicToleranceInspector, PhotometricCorrector, ReferenceBuilder,
-    ResidualConfig, RoiConfig,
+    ResidualConfig, RoiConfig, make_panel,
 )
 from anomaly_inspector.evaluation import (  # noqa: E402
     ModeReport, boxes_from_defects, evaluate_image, load_gt_folder,
@@ -388,17 +388,31 @@ def main() -> None:
                      p.name, ev.n_gt, ev.tp, ev.fn, ev.hard_fp, ev.soft_fp, ms)
 
             if not args.no_panels:
-                gt_full = [g.bbox for g in gt[p.name].boxes]
-                gt_polys = [list(g.polygon) if g.is_polygon else []
-                            for g in gt[p.name].boxes]
+                # GT lives in full-resolution coordinates; the inspector
+                # operates in pred-space (downsampled if --max-input-width
+                # > 0). Lift GT into pred-space so the polygon contours
+                # land on the correct pixels of the inspected image.
+                inv_scale = 1.0 / pred_scale if pred_scale != 0 else 1.0
+                gt_polys_pred = [
+                    [(x * inv_scale, y * inv_scale) for (x, y) in g.polygon]
+                    if g.is_polygon else []
+                    for g in gt[p.name].boxes
+                ]
+                gt_bboxes_pred = [
+                    (g.bbox[0] * inv_scale, g.bbox[1] * inv_scale,
+                     g.bbox[2] * inv_scale, g.bbox[3] * inv_scale)
+                    for g in gt[p.name].boxes
+                ]
                 title = (f"{p.name}  |  mode={mode}  |  "
-                         f"TP={ev.tp}  FN={ev.fn}  hardFP={ev.hard_fp}  softFP={ev.soft_fp}")
-                panel = render_comparison_panel(
-                    img, gt_boxes_full=gt_full,
-                    pred_boxes_pred=pred_boxes, ev=ev,
-                    pred_scale=pred_scale,
-                    roi_mask=ref.roi_mask, title=title,
-                    gt_polygons_full=gt_polys,
+                         f"TP={ev.tp}  FN={ev.fn}  hardFP={ev.hard_fp}  "
+                         f"softFP={ev.soft_fp}")
+                panel = make_panel(
+                    img, result,
+                    max_cell_width=900,
+                    title=title,
+                    roi_mask=ref.roi_mask,
+                    gt_polygons=gt_polys_pred,
+                    gt_bboxes=gt_bboxes_pred,
                 )
                 imwrite_unicode(mode_dir / f"{p.stem}_eval.png", panel)
 
